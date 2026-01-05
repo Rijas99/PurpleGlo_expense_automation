@@ -1,0 +1,27 @@
+﻿# Secrets and API keys - CRITICAL
+secrets.toml
+.streamlit/
+*.toml
+
+# Data and workspace - ALL YOUR EXPENSE DATA
+expense_workspace/
+*.csv
+*.xlsx
+*.zip
+
+# Generated files
+files/
+output_package/
+bills_*/
+*_output_*/
+images/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# OS
+.DS_Store
+Thumbs.db
