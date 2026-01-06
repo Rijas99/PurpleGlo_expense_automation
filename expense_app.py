@@ -190,6 +190,46 @@ def save_data_current(df: pd.DataFrame):
     df.to_csv(DATA_FILE, index=False)
 
 
+def delete_receipt(ref: int) -> tuple[bool, str]:
+    """
+    Delete a receipt by its Ref number.
+    Removes the row from the dataframe and deletes the associated image file.
+    Returns (success: bool, message: str)
+    """
+    try:
+        df = load_data_for(None)  # Load current month data
+
+        # Find the row with matching Ref
+        row_to_delete = df[df["Ref"] == ref]
+        if row_to_delete.empty:
+            return False, f"Receipt with Ref {ref} not found."
+
+        # Get the image path before deleting the row
+        image_path = None
+        if "Original_Image_Path" in row_to_delete.columns:
+            image_path = row_to_delete["Original_Image_Path"].iloc[0]
+
+        # Remove the row from dataframe
+        df = df[df["Ref"] != ref]
+
+        # Delete the associated image file if it exists
+        if image_path:
+            full_image_path = os.path.join(IMAGES_DIR, str(image_path))
+            if os.path.exists(full_image_path):
+                try:
+                    os.remove(full_image_path)
+                except Exception as e:
+                    # Log but don't fail if image deletion fails
+                    pass
+
+        # Save the updated dataframe
+        save_data_current(df)
+        return True, f"Receipt {ref} deleted successfully."
+
+    except Exception as e:
+        return False, f"Error deleting receipt: {str(e)}"
+
+
 def load_cc_for(selected_month_slug: str | None):
     _, _, cc_file, _ = get_paths_for_month(selected_month_slug)
     if os.path.exists(cc_file):
@@ -573,12 +613,57 @@ with tab1:
 
     df_view = load_data_for(selected_month_slug)
     if not df_view.empty:
-        st.dataframe(
-            df_view[
-                ["Ref", "Date", "Description", "Category", "Project Code", "Amount"]
-            ],
-            use_container_width=True,
-        )
+        # Display table with delete buttons
+        # Create header row
+        header_cols = st.columns([1, 2, 3, 2, 2, 1, 1])
+        with header_cols[0]:
+            st.write("**Ref**")
+        with header_cols[1]:
+            st.write("**Date**")
+        with header_cols[2]:
+            st.write("**Description**")
+        with header_cols[3]:
+            st.write("**Category**")
+        with header_cols[4]:
+            st.write("**Project Code**")
+        with header_cols[5]:
+            st.write("**Amount**")
+        with header_cols[6]:
+            if month_view == "CURRENT":
+                st.write("**Actions**")
+
+        st.divider()
+
+        # Display data rows with delete buttons
+        for idx, row in df_view.iterrows():
+            row_cols = st.columns([1, 2, 3, 2, 2, 1, 1])
+            with row_cols[0]:
+                st.write(str(row["Ref"]))
+            with row_cols[1]:
+                st.write(str(row["Date"]))
+            with row_cols[2]:
+                st.write(str(row["Description"]))
+            with row_cols[3]:
+                st.write(str(row["Category"]))
+            with row_cols[4]:
+                st.write(str(row["Project Code"]))
+            with row_cols[5]:
+                st.write(f"{row['Amount']:.2f}")
+            with row_cols[6]:
+                if month_view == "CURRENT":
+                    ref_value = int(row["Ref"])
+                    if st.button(
+                        "🗑️",
+                        key=f"delete_receipt_{ref_value}",
+                        help="Delete this receipt",
+                    ):
+                        success, message = delete_receipt(ref_value)
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+
         st.metric("Total Receipts", f"{df_view['Amount'].sum():.2f} SAR/AED")
     else:
         st.info("No receipt expenses for this month selection.")
