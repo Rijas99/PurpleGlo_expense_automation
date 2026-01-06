@@ -567,6 +567,57 @@ st.markdown(
         font-size: 16px;
         padding: 12px;
     }
+    /* Mobile-friendly table container with horizontal scroll */
+    .mobile-table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        width: 100%;
+        margin: 1rem 0;
+    }
+    .mobile-table-container table {
+        width: 100%;
+        min-width: 600px;
+        border-collapse: collapse;
+        font-size: 14px;
+    }
+    .mobile-table-container th {
+        background-color: rgba(250, 250, 250, 0.1);
+        padding: 12px 8px;
+        text-align: left;
+        font-weight: 600;
+        border-bottom: 2px solid rgba(255, 255, 255, 0.2);
+        white-space: nowrap;
+    }
+    .mobile-table-container td {
+        padding: 12px 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        word-wrap: break-word;
+    }
+    .mobile-table-container tr:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+    /* Mobile-optimized delete button */
+    .mobile-delete-btn {
+        min-width: 48px;
+        min-height: 48px;
+        padding: 8px 12px;
+        font-size: 16px;
+    }
+    /* Responsive column widths */
+    @media (max-width: 768px) {
+        .mobile-table-container table {
+            font-size: 13px;
+        }
+        .mobile-table-container th,
+        .mobile-table-container td {
+            padding: 10px 6px;
+        }
+    }
+    /* Ensure table is scrollable on mobile */
+    .dataframe {
+        overflow-x: auto;
+        display: block;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -613,49 +664,63 @@ with tab1:
 
     df_view = load_data_for(selected_month_slug)
     if not df_view.empty:
-        # Display table with delete buttons
-        # Create header row
-        header_cols = st.columns([1, 2, 3, 2, 2, 1, 1])
-        with header_cols[0]:
-            st.write("**Ref**")
-        with header_cols[1]:
-            st.write("**Date**")
-        with header_cols[2]:
-            st.write("**Description**")
-        with header_cols[3]:
-            st.write("**Category**")
-        with header_cols[4]:
-            st.write("**Project Code**")
-        with header_cols[5]:
-            st.write("**Amount**")
-        with header_cols[6]:
-            if month_view == "CURRENT":
-                st.write("**Actions**")
+        # Prepare display dataframe with optimized column widths for mobile
+        display_df = df_view[
+            ["Ref", "Date", "Description", "Category", "Project Code", "Amount"]
+        ].copy()
 
-        st.divider()
+        # Format and truncate for mobile display
+        display_df["Amount"] = display_df["Amount"].apply(lambda x: f"{x:.2f}")
+        display_df["Description"] = display_df["Description"].apply(
+            lambda x: (str(x)[:35] + "...") if len(str(x)) > 35 else str(x)
+        )
+        display_df["Category"] = display_df["Category"].apply(
+            lambda x: (str(x)[:22] + "...") if len(str(x)) > 22 else str(x)
+        )
+        display_df["Project Code"] = display_df["Project Code"].apply(
+            lambda x: (str(x)[:18] + "...") if len(str(x)) > 18 else str(x)
+        )
 
-        # Display data rows with delete buttons
-        for idx, row in df_view.iterrows():
-            row_cols = st.columns([1, 2, 3, 2, 2, 1, 1])
-            with row_cols[0]:
-                st.write(str(row["Ref"]))
-            with row_cols[1]:
-                st.write(str(row["Date"]))
-            with row_cols[2]:
-                st.write(str(row["Description"]))
-            with row_cols[3]:
-                st.write(str(row["Category"]))
-            with row_cols[4]:
-                st.write(str(row["Project Code"]))
-            with row_cols[5]:
-                st.write(f"{row['Amount']:.2f}")
-            with row_cols[6]:
-                if month_view == "CURRENT":
-                    ref_value = int(row["Ref"])
+        # Display scrollable table - st.dataframe handles mobile scrolling well
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ref": st.column_config.NumberColumn("Ref", width="small"),
+                "Date": st.column_config.TextColumn("Date", width="small"),
+                "Description": st.column_config.TextColumn(
+                    "Description", width="medium"
+                ),
+                "Category": st.column_config.TextColumn("Category", width="medium"),
+                "Project Code": st.column_config.TextColumn(
+                    "Project Code", width="medium"
+                ),
+                "Amount": st.column_config.NumberColumn(
+                    "Amount", width="small", format="%.2f"
+                ),
+            },
+        )
+
+        # Delete buttons section - mobile-friendly grid layout
+        if month_view == "CURRENT":
+            st.divider()
+            st.write("**🗑️ Delete Receipts:**")
+            # Create responsive grid: 2 columns on mobile, 3-4 on larger screens
+            num_cols = (
+                min(3, len(df_view)) if len(df_view) > 3 else max(2, len(df_view))
+            )
+            delete_cols = st.columns(num_cols)
+
+            for idx, row in df_view.iterrows():
+                col_idx = idx % num_cols
+                ref_value = int(row["Ref"])
+                with delete_cols[col_idx]:
                     if st.button(
-                        "🗑️",
+                        f"🗑️ Delete #{ref_value}",
                         key=f"delete_receipt_{ref_value}",
-                        help="Delete this receipt",
+                        use_container_width=True,
+                        help=f"Delete receipt {ref_value}: {row['Description'][:25]}",
                     ):
                         success, message = delete_receipt(ref_value)
                         if success:
