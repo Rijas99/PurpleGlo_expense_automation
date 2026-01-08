@@ -861,6 +861,16 @@ with tab1:
                         value=float(default_amt),
                     )
 
+                    # Checkbox for capping food bills - only show for Food & Beverages
+                    cap_to_40 = False
+                    if category == "Food & Beverages":
+                        cap_to_40 = st.checkbox(
+                            "Cap amount to 40 SAR/AED",
+                            value=False,
+                            key="cap_food_bill_checkbox",
+                            help="If checked, amount will be capped at 40 and noted in description",
+                        )
+
                 submitted = st.form_submit_button(
                     "✅ Save Receipt Expense", use_container_width=True
                 )
@@ -869,7 +879,8 @@ with tab1:
                     final_desc = description.strip()
                     final_amt = float(amount)
 
-                    if category == "Food & Beverages" and final_amt > 40:
+                    # Only cap if checkbox is checked, category is Food & Beverages, and amount > 40
+                    if category == "Food & Beverages" and cap_to_40 and final_amt > 40:
                         final_desc = f"{final_desc} (capped at 40)"
                         final_amt = 40.0
                         st.warning("Amount capped at 40")
