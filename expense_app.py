@@ -180,6 +180,7 @@ def load_data_for(selected_month_slug: str | None):
             "Description",
             "Category",
             "Project Code",
+            "Project Name",
             "Amount",
             "Original_Image_Path",
         ]
@@ -360,14 +361,48 @@ def get_meal_description(time_obj):
 
 
 def _extract_json(text: str) -> dict:
+    if not text:
+        raise ValueError("Empty response from Gemini.")
+
+    # Remove markdown code blocks
     text = text.strip().replace("```json", "").replace("```", "").strip()
+
+    # Try direct JSON parsing first
     try:
         return json.loads(text)
-    except Exception:
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not m:
-            raise ValueError("No JSON object found in Gemini response.")
-        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        pass
+
+    # Try a greedy approach - find content between first { and last }
+    # This handles nested objects and objects with arrays
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        json_str = text[first_brace : last_brace + 1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+
+    # Try to find JSON object patterns (handle simple nested cases)
+    # Look for { followed by content and }
+    json_pattern = r"\{(?:[^{}]|(?:\{[^{}]*\}))*\}"
+    matches = re.findall(json_pattern, text, re.DOTALL)
+
+    if matches:
+        # Try each match, starting with the longest (most likely to be complete)
+        matches.sort(key=len, reverse=True)
+        for match in matches:
+            try:
+                return json.loads(match)
+            except json.JSONDecodeError:
+                continue
+
+    # If all else fails, raise with the actual response for debugging
+    raise ValueError(
+        f"No valid JSON object found in Gemini response. Response: {text[:200]}"
+    )
 
 
 # =========================================================
@@ -384,30 +419,65 @@ def analyze_receipt_gemini(image_file):
     model = genai.GenerativeModel("gemini-2.5-flash")
     img = Image.open(image_file)
 
-    prompt = """
-Analyze this receipt image. Extract strictly JSON:
-1) date YYYY-MM-DD
-2) time HH:MM (24h) or null
-3) amount numeric only
-4) description short
-5) category one of:
-["Hotel Booking","Food & Beverages","Visa & Ticket","Parking","R & D Expenses","Subscriptions",
-"Office - Tools & Consumables","Project - Consumables","Transportation",
-"Project Expenses - Miscellaneous","Office Expenses - Miscellaneous","Can't classify"]
+    prompt = """Analyze this receipt image and extract the following information.
 
-Return ONLY JSON.
-"""
+Return ONLY a valid JSON object with these exact keys:
+- "date": YYYY-MM-DD format (required)
+- "time": HH:MM format (24-hour) or null if not available
+- "amount": numeric value only (required)
+- "description": short description text (required)
+- "category": must be one of these exact strings:
+  "Hotel Booking", "Food & Beverages", "Visa & Ticket", "Parking", "R & D Expenses", "Subscriptions",
+  "Office - Tools & Consumables", "Project - Consumables", "Transportation",
+  "Project Expenses - Miscellaneous", "Office Expenses - Miscellaneous", "Can't classify"
+
+Example output format:
+{"date": "2024-01-15", "time": "14:30", "amount": 45.50, "description": "Restaurant meal", "category": "Food & Beverages"}
+
+Return ONLY the JSON object, no other text or explanation."""
+
+    # Optimize for speed: temperature=0 for faster deterministic responses,
+    # max_output_tokens set to allow for complete JSON responses (increased slightly for reliability)
+    generation_config = {
+        "temperature": 0,
+        "max_output_tokens": 500,  # Increased to ensure complete JSON responses
+    }
+
     try:
-        response = model.generate_content([prompt, img])
+        response = model.generate_content(
+            [prompt, img], generation_config=generation_config
+        )
+
+        if not response or not response.text:
+            st.error("AI Error: Empty response from Gemini API.")
+            return None
+
         return _extract_json(response.text)
+    except ValueError as e:
+        # JSON extraction error - show helpful message
+        error_msg = str(e)
+        st.error(f"AI Error: Failed to parse JSON from Gemini response. {error_msg}")
+        # Log the raw response for debugging (first 500 chars)
+        if "Response:" in error_msg:
+            st.code(error_msg.split("Response:")[1][:500], language="text")
+        return None
     except Exception as e:
         msg = str(e)
         if "429" in msg:
             wait_s = parse_retry_seconds(msg) or 30
             st.warning(f"Rate limit hit. Waiting {wait_s}s then retrying once...")
             time_module.sleep(wait_s)
-            response = model.generate_content([prompt, img])
-            return _extract_json(response.text)
+            try:
+                response = model.generate_content(
+                    [prompt, img], generation_config=generation_config
+                )
+                if not response or not response.text:
+                    st.error("AI Error: Empty response from Gemini API on retry.")
+                    return None
+                return _extract_json(response.text)
+            except ValueError as ve:
+                st.error(f"AI Error: Failed to parse JSON on retry. {str(ve)}")
+                return None
         st.error(f"AI Error: {e}")
         return None
 
@@ -665,9 +735,13 @@ with tab1:
     df_view = load_data_for(selected_month_slug)
     if not df_view.empty:
         # Prepare display dataframe with optimized column widths for mobile
-        display_df = df_view[
-            ["Ref", "Date", "Description", "Category", "Project Code", "Amount"]
-        ].copy()
+        # Check if Project Name column exists (for backward compatibility)
+        display_columns = ["Ref", "Date", "Description", "Category", "Project Code"]
+        if "Project Name" in df_view.columns:
+            display_columns.append("Project Name")
+        display_columns.append("Amount")
+
+        display_df = df_view[display_columns].copy()
 
         # Format and truncate for mobile display
         display_df["Amount"] = display_df["Amount"].apply(lambda x: f"{x:.2f}")
@@ -680,26 +754,36 @@ with tab1:
         display_df["Project Code"] = display_df["Project Code"].apply(
             lambda x: (str(x)[:18] + "...") if len(str(x)) > 18 else str(x)
         )
+        if "Project Name" in display_df.columns:
+            display_df["Project Name"] = display_df["Project Name"].apply(
+                lambda x: (
+                    (str(x)[:20] + "...")
+                    if len(str(x)) > 20
+                    else str(x) if pd.notna(x) else ""
+                )
+            )
 
         # Display scrollable table - st.dataframe handles mobile scrolling well
+        column_config = {
+            "Ref": st.column_config.NumberColumn("Ref", width="small"),
+            "Date": st.column_config.TextColumn("Date", width="small"),
+            "Description": st.column_config.TextColumn("Description", width="medium"),
+            "Category": st.column_config.TextColumn("Category", width="medium"),
+            "Project Code": st.column_config.TextColumn("Project Code", width="medium"),
+            "Amount": st.column_config.NumberColumn(
+                "Amount", width="small", format="%.2f"
+            ),
+        }
+        if "Project Name" in display_df.columns:
+            column_config["Project Name"] = st.column_config.TextColumn(
+                "Project Name", width="medium"
+            )
+
         st.dataframe(
             display_df,
             use_container_width=True,
             hide_index=True,
-            column_config={
-                "Ref": st.column_config.NumberColumn("Ref", width="small"),
-                "Date": st.column_config.TextColumn("Date", width="small"),
-                "Description": st.column_config.TextColumn(
-                    "Description", width="medium"
-                ),
-                "Category": st.column_config.TextColumn("Category", width="medium"),
-                "Project Code": st.column_config.TextColumn(
-                    "Project Code", width="medium"
-                ),
-                "Amount": st.column_config.NumberColumn(
-                    "Amount", width="small", format="%.2f"
-                ),
-            },
+            column_config=column_config,
         )
 
         # Delete buttons section - mobile-friendly grid layout
@@ -745,33 +829,22 @@ with tab1:
             st.image(uploaded_file, caption="Receipt Preview", use_container_width=True)
             h = file_hash(uploaded_file)
 
-            analyze_btn = st.button(
-                "🤖 Analyze Receipt with AI",
-                key="rcpt_analyze_btn",
-                use_container_width=True,
-            )
-            clear_btn = st.button(
-                "♻️ Clear AI Result", key="rcpt_clear_btn", use_container_width=True
-            )
-
-            if clear_btn:
-                st.session_state.pop("receipt_ai_hash", None)
-                st.session_state.pop("receipt_ai_data", None)
-
-            if analyze_btn:
-                if st.session_state.get(
-                    "receipt_ai_hash"
-                ) == h and st.session_state.get("receipt_ai_data"):
-                    st.info("Using cached AI result.")
-                else:
-                    with st.spinner("Reading receipt with Gemini..."):
-                        ai_data = analyze_receipt_gemini(uploaded_file)
-                        if ai_data:
-                            st.session_state["receipt_ai_data"] = ai_data
-                            st.session_state["receipt_ai_hash"] = h
-                            st.toast("Receipt AI completed!")
-
-            ai_data = st.session_state.get("receipt_ai_data", {})
+            # Automatically analyze receipt if not already cached
+            if st.session_state.get("receipt_ai_hash") == h and st.session_state.get(
+                "receipt_ai_data"
+            ):
+                # Use cached result
+                ai_data = st.session_state.get("receipt_ai_data", {})
+            else:
+                # Automatically trigger analysis
+                with st.spinner("Reading receipt with Gemini..."):
+                    ai_data = analyze_receipt_gemini(uploaded_file)
+                    if ai_data:
+                        st.session_state["receipt_ai_data"] = ai_data
+                        st.session_state["receipt_ai_hash"] = h
+                        st.toast("Receipt analyzed successfully!")
+                    else:
+                        ai_data = {}
             default_date = datetime.today()
             default_desc = ""
             default_cat = "Project - Consumables"
@@ -843,6 +916,12 @@ with tab1:
                     else:
                         project_code = selected_code_option
 
+                    project_name = st.text_input(
+                        "Project Name *",
+                        placeholder="e.g., Project Alpha",
+                        help="Enter the project name (required)",
+                    )
+
                 with c2:
                     if category == "Food & Beverages":
                         meal = get_meal_description(
@@ -878,32 +957,44 @@ with tab1:
                 if submitted:
                     final_desc = description.strip()
                     final_amt = float(amount)
+                    final_project_name = project_name.strip() if project_name else ""
 
-                    # Only cap if checkbox is checked, category is Food & Beverages, and amount > 40
-                    if category == "Food & Beverages" and cap_to_40 and final_amt > 40:
-                        final_desc = f"{final_desc} (capped at 40)"
-                        final_amt = 40.0
-                        st.warning("Amount capped at 40")
+                    # Validation
+                    if not final_project_name:
+                        st.error(
+                            "Project Name is required. Please enter a project name."
+                        )
+                    else:
+                        # Only cap if checkbox is checked, category is Food & Beverages, and amount > 40
+                        if (
+                            category == "Food & Beverages"
+                            and cap_to_40
+                            and final_amt > 40
+                        ):
+                            final_desc = f"{final_desc} (capped at 40)"
+                            final_amt = 40.0
+                            st.warning("Amount capped at 40")
 
-                    temp_filename = f"temp_{datetime.now().timestamp()}.jpg"
-                    save_path = os.path.join(IMAGES_DIR, temp_filename)
-                    with open(save_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
+                        temp_filename = f"temp_{datetime.now().timestamp()}.jpg"
+                        save_path = os.path.join(IMAGES_DIR, temp_filename)
+                        with open(save_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
 
-                    df = load_data_for(None)
-                    new_row = {
-                        "Ref": len(df) + 1,
-                        "Date": formatted_date,
-                        "Description": final_desc,
-                        "Category": category,
-                        "Project Code": project_code,
-                        "Amount": final_amt,
-                        "Original_Image_Path": temp_filename,
-                    }
-                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                    save_data_current(df)
-                    st.success("Saved!")
-                    st.rerun()
+                        df = load_data_for(None)
+                        new_row = {
+                            "Ref": len(df) + 1,
+                            "Date": formatted_date,
+                            "Description": final_desc,
+                            "Category": category,
+                            "Project Code": project_code,
+                            "Project Name": final_project_name,
+                            "Amount": final_amt,
+                            "Original_Image_Path": temp_filename,
+                        }
+                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                        save_data_current(df)
+                        st.success("Saved!")
+                        st.rerun()
 
     st.divider()
     st.subheader("📦 Generate Receipts Package")
