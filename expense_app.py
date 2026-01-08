@@ -236,7 +236,14 @@ def load_cc_for(selected_month_slug: str | None):
     if os.path.exists(cc_file):
         return pd.read_csv(cc_file)
     return pd.DataFrame(
-        columns=["Date", "Description", "Category", "Project Code", "Amount"]
+        columns=[
+            "Date",
+            "Description",
+            "Category",
+            "Project Code",
+            "Project Name",
+            "Amount",
+        ]
     )
 
 
@@ -262,6 +269,7 @@ def load_transport_data(selected_month_slug: str | None = None):
             "Destination",
             "Return Included",
             "Project Code",
+            "Project Name",
         ]
     )
 
@@ -274,7 +282,7 @@ def save_transport_data(df: pd.DataFrame):
 def generate_transport_excel(df: pd.DataFrame, output_path: str):
     """
     Generate Excel file for transport expenses.
-    Columns: Date, From, Destination, Return Included, Project Code
+    Columns: Date, From, Destination, Return Included, Project Code, Project Name
     """
     if df.empty:
         st.warning("No transport expenses to export.")
@@ -290,6 +298,8 @@ def generate_transport_excel(df: pd.DataFrame, output_path: str):
         lambda x: "Return Included" if x else ""
     )
     excel_df["Project Code"] = df["Project Code"]
+    if "Project Name" in df.columns:
+        excel_df["Project Name"] = df["Project Name"].fillna("")
 
     # Write to Excel
     excel_df.to_excel(output_path, index=False, engine="openpyxl")
@@ -994,6 +1004,17 @@ with tab1:
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                         save_data_current(df)
                         st.success("Saved!")
+
+                        # Clear form and photo after successful save
+                        if "receipt_upload" in st.session_state:
+                            del st.session_state["receipt_upload"]
+                        if "receipt_ai_hash" in st.session_state:
+                            del st.session_state["receipt_ai_hash"]
+                        if "receipt_ai_data" in st.session_state:
+                            del st.session_state["receipt_ai_data"]
+                        if "cap_food_bill_checkbox" in st.session_state:
+                            del st.session_state["cap_food_bill_checkbox"]
+
                         st.rerun()
 
     st.divider()
@@ -1019,8 +1040,14 @@ with tab2:
 
     cc_view = load_cc_for(selected_month_slug)
     if not cc_view.empty:
+        # Prepare display columns with backward compatibility
+        display_columns = ["Date", "Description", "Category", "Project Code"]
+        if "Project Name" in cc_view.columns:
+            display_columns.append("Project Name")
+        display_columns.append("Amount")
+
         st.dataframe(
-            cc_view[["Date", "Description", "Category", "Project Code", "Amount"]],
+            cc_view[display_columns],
             use_container_width=True,
         )
         st.metric("Total Credit Card", f"{cc_view['Amount'].sum():.2f} SAR/AED")
@@ -1045,33 +1072,23 @@ with tab2:
             )
             h = file_hash(uploaded_statement)
 
-            analyze_cc_btn = st.button(
-                "🤖 Analyze Statement with AI",
-                key="cc_analyze_btn",
-                use_container_width=True,
-            )
-            clear_cc_btn = st.button(
-                "♻️ Clear AI Result", key="cc_clear_btn", use_container_width=True
-            )
-
-            if clear_cc_btn:
-                st.session_state.pop("cc_ai_hash", None)
-                st.session_state.pop("cc_ai_data", None)
-
-            if analyze_cc_btn:
-                if st.session_state.get("cc_ai_hash") == h and st.session_state.get(
-                    "cc_ai_data"
-                ):
-                    st.info("Using cached AI result.")
-                else:
-                    with st.spinner("Reading statement with Gemini..."):
-                        data = analyze_credit_card_statement(uploaded_statement)
-                        if data:
-                            st.session_state["cc_ai_data"] = data
-                            st.session_state["cc_ai_hash"] = h
-                            st.toast("Statement AI completed!")
-
-            ai_data = st.session_state.get("cc_ai_data", {})
+            # Automatically analyze statement if not already cached
+            if st.session_state.get("cc_ai_hash") == h and st.session_state.get(
+                "cc_ai_data"
+            ):
+                # Use cached result
+                ai_data = st.session_state.get("cc_ai_data", {})
+            else:
+                # Automatically trigger analysis
+                with st.spinner("Reading statement with Gemini..."):
+                    data = analyze_credit_card_statement(uploaded_statement)
+                    if data:
+                        st.session_state["cc_ai_data"] = data
+                        st.session_state["cc_ai_hash"] = h
+                        st.toast("Statement analyzed successfully!")
+                        ai_data = data
+                    else:
+                        ai_data = {}
 
         default_date = datetime.today()
         default_desc = ""
@@ -1131,6 +1148,12 @@ with tab2:
                 else:
                     project_code = selected_code_option
 
+                project_name = st.text_input(
+                    "Project Name *",
+                    placeholder="e.g., Project Alpha",
+                    help="Enter the project name (required)",
+                )
+
             with c2:
                 description = st.text_input("Description", value=default_desc)
                 amount = st.number_input(
@@ -1140,6 +1163,16 @@ with tab2:
                     value=float(default_amt),
                 )
 
+                # Checkbox for capping food bills - only show for Food & Beverages
+                cap_to_40 = False
+                if category == "Food & Beverages":
+                    cap_to_40 = st.checkbox(
+                        "Cap amount to 40 SAR/AED",
+                        value=False,
+                        key="cc_cap_food_bill_checkbox",
+                        help="If checked, amount will be capped at 40 and noted in description",
+                    )
+
             submitted = st.form_submit_button(
                 "✅ Save Credit Card Expense", use_container_width=True
             )
@@ -1147,20 +1180,44 @@ with tab2:
             if submitted:
                 if not description.strip():
                     st.error("Description required.")
+                elif not project_name.strip():
+                    st.error("Project Name is required. Please enter a project name.")
                 else:
+                    final_desc = description.strip()
+                    final_amt = float(amount)
+                    final_project_name = project_name.strip()
+
+                    # Only cap if checkbox is checked, category is Food & Beverages, and amount > 40
+                    if category == "Food & Beverages" and cap_to_40 and final_amt > 40:
+                        final_desc = f"{final_desc} (capped at 40)"
+                        final_amt = 40.0
+                        st.warning("Amount capped at 40")
+
                     cc_df = load_cc_for(None)
                     new_row = {
                         "Date": formatted_date,
-                        "Description": description.strip(),
+                        "Description": final_desc,
                         "Category": category,
                         "Project Code": project_code if project_code else "",
-                        "Amount": float(amount),
+                        "Project Name": final_project_name,
+                        "Amount": final_amt,
                     }
                     cc_df = pd.concat(
                         [cc_df, pd.DataFrame([new_row])], ignore_index=True
                     )
                     save_cc_current(cc_df)
                     st.success("Saved!")
+
+                    # Clear form and photo after successful save
+                    if "cc_upload" in st.session_state:
+                        del st.session_state["cc_upload"]
+                    if "cc_ai_hash" in st.session_state:
+                        del st.session_state["cc_ai_hash"]
+                    if "cc_ai_data" in st.session_state:
+                        del st.session_state["cc_ai_data"]
+                    if "cc_cap_food_bill_checkbox" in st.session_state:
+                        del st.session_state["cc_cap_food_bill_checkbox"]
+
                     st.rerun()
 
     st.divider()
@@ -1230,6 +1287,12 @@ with tab3:
             else:
                 project_code = selected_code_option
 
+            project_name = st.text_input(
+                "Project Name *",
+                placeholder="e.g., Project Alpha",
+                help="Enter the project name (required)",
+            )
+
         submitted = st.form_submit_button(
             "✅ Save Transportation Expense", use_container_width=True
         )
@@ -1241,6 +1304,8 @@ with tab3:
                 errors.append("Please enter From location")
             if not destination or not destination.strip():
                 errors.append("Please enter Destination")
+            if not project_name or not project_name.strip():
+                errors.append("Please enter Project Name")
 
             if errors:
                 for error in errors:
@@ -1255,6 +1320,7 @@ with tab3:
                     "Destination": destination.strip(),
                     "Return Included": return_included,
                     "Project Code": project_code if project_code else "",
+                    "Project Name": project_name.strip(),
                 }
 
                 transport_df = pd.concat(
@@ -1287,10 +1353,18 @@ with tab3:
             month_transport = transport_df.copy()
 
         if not month_transport.empty:
-            # Prepare display dataframe
-            display_df = month_transport[
-                ["Date", "From", "Destination", "Return Included", "Project Code"]
-            ].copy()
+            # Prepare display dataframe with backward compatibility
+            display_columns = [
+                "Date",
+                "From",
+                "Destination",
+                "Return Included",
+                "Project Code",
+            ]
+            if "Project Name" in month_transport.columns:
+                display_columns.append("Project Name")
+
+            display_df = month_transport[display_columns].copy()
 
             # Convert boolean to readable text
             display_df["Return Included"] = display_df["Return Included"].apply(
@@ -1306,6 +1380,12 @@ with tab3:
                     x[:-2] if x.endswith(".0") and x.replace(".0", "").isdigit() else x
                 )
             )
+
+            # Handle empty/null project names
+            if "Project Name" in display_df.columns:
+                display_df["Project Name"] = (
+                    display_df["Project Name"].fillna("").astype(str)
+                )
 
             st.dataframe(display_df, use_container_width=True)
 
