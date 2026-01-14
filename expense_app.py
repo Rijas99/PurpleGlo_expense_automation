@@ -450,7 +450,7 @@ Return ONLY the JSON object, no other text or explanation."""
     # max_output_tokens set to allow for complete JSON responses (increased slightly for reliability)
     generation_config = {
         "temperature": 0,
-        "max_output_tokens": 500,  # Increased to ensure complete JSON responses
+        "max_output_tokens": 1000,  # Increased to ensure complete JSON responses
     }
 
     try:
