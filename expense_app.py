@@ -11,7 +11,7 @@ import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 import io
 import tempfile
 import shutil
@@ -72,8 +72,8 @@ def upload_image_to_drive(image_file, filename):
             'parents': [DRIVE_FOLDER_ID]
         }
         
-        # Create media content from the uploaded file directly
-        media = MediaFileUpload(
+        # Create media content from BytesIO - use MediaIoBaseUpload for in-memory files
+        media = MediaIoBaseUpload(
             io.BytesIO(image_file.getvalue()),
             mimetype='image/jpeg',
             resumable=True
