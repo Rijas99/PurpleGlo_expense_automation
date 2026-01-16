@@ -10,14 +10,18 @@ from PIL import Image
 import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 import io
 import tempfile
 import shutil
+import base64
 
 # =========================================================
-# GOOGLE SHEETS & DRIVE CONFIGURATION
+# VERSION INFO
+# =========================================================
+APP_VERSION = "v2.0.0 - Base64 Storage"
+
+# =========================================================
+# GOOGLE SHEETS CONFIGURATION
 # =========================================================
 
 # Get credentials from Streamlit secrets
@@ -34,18 +38,16 @@ SCOPE = [
 
 creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, SCOPE)
 sheets_client = gspread.authorize(creds)
-drive_service = build('drive', 'v3', credentials=creds)
 
-# Google Sheet and Drive settings
-SHEET_NAME = "PurpleGlo_Expenses"  # Your Google Sheet name
-DRIVE_FOLDER_ID = "1BG0cVmy77uWbJJ2ul3QJw0pYfkA95p0I"  # Your Drive folder ID
+# Google Sheet settings
+SHEET_NAME = "PurpleGlo_Expenses"
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
 MAX_HISTORY_MONTHS = 3
 
 # =========================================================
-# GOOGLE SHEETS & DRIVE HELPERS
+# GOOGLE SHEETS HELPERS
 # =========================================================
 
 def get_worksheet(sheet_name):
@@ -60,75 +62,38 @@ def get_worksheet(sheet_name):
         st.error(f"Failed to access Google Sheet '{SHEET_NAME}'. Make sure it's shared with the service account.")
         raise e
 
-def upload_image_to_drive(image_file, filename):
-    """Upload image to Google Drive and return shareable link and file ID"""
+def encode_image_to_base64(image_file):
+    """Convert uploaded image to base64 string"""
     try:
-        # Reset file pointer
         image_file.seek(0)
+        image_bytes = image_file.getvalue()
+        # Compress image if needed
+        img = Image.open(io.BytesIO(image_bytes))
         
-        # Create file metadata
-        file_metadata = {
-            'name': filename,
-            'parents': [DRIVE_FOLDER_ID]
-        }
+        # Resize if too large (max 800px width)
+        max_width = 800
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_width, new_height), Image.LANCZOS)
         
-        # Create media content from BytesIO - use MediaIoBaseUpload for in-memory files
-        media = MediaIoBaseUpload(
-            io.BytesIO(image_file.getvalue()),
-            mimetype='image/jpeg',
-            resumable=True
-        )
+        # Save as JPEG with compression
+        output = io.BytesIO()
+        img.convert('RGB').save(output, format='JPEG', quality=85, optimize=True)
+        output.seek(0)
         
-        # Upload to Drive with supportsAllDrives parameter
-        file = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields='id, webViewLink',
-            supportsAllDrives=True
-        ).execute()
-        
-        # Make file publicly viewable
-        drive_service.permissions().create(
-            fileId=file['id'],
-            body={'type': 'anyone', 'role': 'reader'},
-            supportsAllDrives=True
-        ).execute()
-        
-        return file.get('webViewLink'), file.get('id')
-        
+        # Encode to base64
+        base64_str = base64.b64encode(output.getvalue()).decode('utf-8')
+        return base64_str
     except Exception as e:
-        st.error(f"Failed to upload image to Drive: {e}")
-        return None, None
+        st.error(f"Failed to encode image: {e}")
+        return None
 
-def delete_image_from_drive(image_id):
-    """Delete image from Google Drive"""
+def decode_base64_to_image(base64_str):
+    """Convert base64 string back to image bytes"""
     try:
-        if image_id and image_id.strip():
-            drive_service.files().delete(
-                fileId=image_id,
-                supportsAllDrives=True
-            ).execute()
-        return True
-    except Exception as e:
-        # Don't fail if image doesn't exist or already deleted
-        return True
-
-def download_image_from_drive(image_id):
-    """Download image from Google Drive for export"""
-    try:
-        if not image_id or not image_id.strip():
-            return None
-        request = drive_service.files().get_media(
-            fileId=image_id,
-            supportsAllDrives=True
-        )
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while done is False:
-            status, done = downloader.next_chunk()
-        fh.seek(0)
-        return fh
+        image_bytes = base64.b64decode(base64_str)
+        return io.BytesIO(image_bytes)
     except Exception as e:
         return None
 
@@ -143,7 +108,7 @@ def load_data_from_sheets(sheet_name):
                 return pd.DataFrame(columns=[
                     "Ref", "Date", "Description", "Category", 
                     "Project Code", "Project Name", "Amount", 
-                    "Image_Link", "Image_ID"
+                    "Image_Data"
                 ])
             elif sheet_name == "CreditCard":
                 return pd.DataFrame(columns=[
@@ -163,7 +128,7 @@ def load_data_from_sheets(sheet_name):
             return pd.DataFrame(columns=[
                 "Ref", "Date", "Description", "Category", 
                 "Project Code", "Project Name", "Amount", 
-                "Image_Link", "Image_ID"
+                "Image_Data"
             ])
         elif sheet_name == "CreditCard":
             return pd.DataFrame(columns=[
@@ -184,7 +149,7 @@ def save_data_to_sheets(df, sheet_name):
         worksheet.clear()
         # Convert DataFrame to list of lists
         data = [df.columns.values.tolist()] + df.values.tolist()
-        # Update the sheet
+        # Update the sheet (batch update is more efficient)
         worksheet.update(data, value_input_option='USER_ENTERED')
         return True
     except Exception as e:
@@ -220,7 +185,7 @@ def save_transport_data(df: pd.DataFrame):
     return save_data_to_sheets(df, "Transport")
 
 def delete_receipt(ref: int) -> tuple[bool, str]:
-    """Delete receipt from Sheets and Drive"""
+    """Delete receipt from Sheets"""
     try:
         df = load_data_for(None)
         
@@ -228,13 +193,7 @@ def delete_receipt(ref: int) -> tuple[bool, str]:
         if row_to_delete.empty:
             return False, f"Receipt {ref} not found."
         
-        # Get image ID and delete from Drive
-        if "Image_ID" in row_to_delete.columns:
-            image_id = row_to_delete["Image_ID"].iloc[0]
-            if pd.notna(image_id) and str(image_id).strip():
-                delete_image_from_drive(str(image_id))
-        
-        # Remove from DataFrame
+        # Remove from DataFrame (image data is automatically deleted)
         df = df[df["Ref"] != ref]
         
         # Save to Sheets
@@ -476,7 +435,7 @@ def generate_transport_excel(df: pd.DataFrame, output_path: str):
     excel_df.to_excel(output_path, index=False, engine="openpyxl")
 
 def generate_receipts_package(report_month: str):
-    """Generate receipts package with images downloaded from Drive"""
+    """Generate receipts package with images decoded from base64"""
     df = load_data_for(None)
     
     if df.empty:
@@ -491,28 +450,26 @@ def generate_receipts_package(report_month: str):
         bills_folder = os.path.join(output_folder, f"bills_{month_slug}")
         os.makedirs(bills_folder, exist_ok=True)
 
-        # Download images from Drive
-        if "Image_ID" in df.columns:
+        # Decode and save images from base64
+        if "Image_Data" in df.columns:
             progress_bar = st.progress(0)
             total = len(df)
             for idx, (_, row) in enumerate(df.iterrows()):
-                image_id = row.get("Image_ID")
-                if pd.notna(image_id) and str(image_id).strip():
-                    image_data = download_image_from_drive(str(image_id))
-                    if image_data:
+                image_data = row.get("Image_Data")
+                if pd.notna(image_data) and str(image_data).strip():
+                    image_bytes = decode_base64_to_image(str(image_data))
+                    if image_bytes:
                         dst = os.path.join(bills_folder, f"{row['Ref']}.jpg")
                         with open(dst, 'wb') as f:
-                            f.write(image_data.read())
+                            f.write(image_bytes.read())
                 progress_bar.progress((idx + 1) / total)
             progress_bar.empty()
 
         # Create Excel
         excel_path = os.path.join(output_folder, f"Receipts_Expenses_{month_slug}.xlsx")
         export_df = df.copy()
-        if "Image_Link" in export_df.columns:
-            export_df = export_df.drop(columns=["Image_Link"])
-        if "Image_ID" in export_df.columns:
-            export_df = export_df.drop(columns=["Image_ID"])
+        if "Image_Data" in export_df.columns:
+            export_df = export_df.drop(columns=["Image_Data"])
         export_df.to_excel(excel_path, index=False, engine="openpyxl")
 
         # Create ZIP
@@ -591,16 +548,30 @@ st.markdown("""
         overflow-x: auto;
         display: block;
     }
+    .version-badge {
+        position: fixed;
+        bottom: 10px;
+        right: 10px;
+        background: rgba(100, 100, 255, 0.8);
+        color: white;
+        padding: 5px 10px;
+        border-radius: 5px;
+        font-size: 12px;
+        z-index: 1000;
+    }
     </style>
     """, unsafe_allow_html=True)
 
 st.title("🟣 PurpleGlo Expense Manager")
 
+# Version badge
+st.markdown(f'<div class="version-badge">{APP_VERSION}</div>', unsafe_allow_html=True)
+
 # Sidebar
 st.sidebar.header("Settings")
 report_month = st.sidebar.text_input("Report Month", value=datetime.now().strftime("%b %Y"))
 st.sidebar.write("✅ Connected to Google Sheets")
-st.sidebar.write("✅ Connected to Google Drive")
+st.sidebar.write(f"📌 Version: {APP_VERSION}")
 
 tab1, tab2, tab3 = st.tabs(["📸 Add Receipt", "💳 Credit Card", "🚗 Transportation"])
 
@@ -755,15 +726,12 @@ with tab1:
                         final_amt = 40.0
                         st.warning("Amount capped at 40")
 
-                    # Upload image to Drive
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    df = load_data_for(None)
-                    filename = f"receipt_{timestamp}_{len(df)+1}.jpg"
+                    # Encode image to base64
+                    with st.spinner("Processing image..."):
+                        image_base64 = encode_image_to_base64(uploaded_file)
                     
-                    with st.spinner("Uploading image to Google Drive..."):
-                        image_link, image_id = upload_image_to_drive(uploaded_file, filename)
-                    
-                    if image_link:
+                    if image_base64:
+                        df = load_data_for(None)
                         new_row = {
                             "Ref": len(df) + 1,
                             "Date": formatted_date,
@@ -772,23 +740,23 @@ with tab1:
                             "Project Code": project_code,
                             "Project Name": final_project_name,
                             "Amount": final_amt,
-                            "Image_Link": image_link,
-                            "Image_ID": image_id
+                            "Image_Data": image_base64
                         }
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
                         
-                        if save_data_current(df):
-                            st.success("Saved successfully!")
-                            # Clear cache
-                            for key in ["receipt_upload", "receipt_ai_hash", "receipt_ai_data", 
-                                       "cap_food_bill_checkbox"]:
-                                if key in st.session_state:
-                                    del st.session_state[key]
-                            st.rerun()
-                        else:
-                            st.error("Failed to save to Google Sheets")
+                        with st.spinner("Saving to Google Sheets..."):
+                            if save_data_current(df):
+                                st.success("Saved successfully!")
+                                # Clear cache
+                                for key in ["receipt_upload", "receipt_ai_hash", "receipt_ai_data", 
+                                           "cap_food_bill_checkbox"]:
+                                    if key in st.session_state:
+                                        del st.session_state[key]
+                                st.rerun()
+                            else:
+                                st.error("Failed to save to Google Sheets")
                     else:
-                        st.error("Failed to upload image. Please try again.")
+                        st.error("Failed to process image. Please try again.")
 
     st.divider()
     st.subheader("📦 Generate Receipts Package")
