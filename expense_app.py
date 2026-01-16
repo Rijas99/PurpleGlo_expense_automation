@@ -79,17 +79,19 @@ def upload_image_to_drive(image_file, filename):
             resumable=True
         )
         
-        # Upload to Drive
+        # Upload to Drive with supportsAllDrives parameter
         file = drive_service.files().create(
             body=file_metadata,
             media_body=media,
-            fields='id, webViewLink, webContentLink'
+            fields='id, webViewLink',
+            supportsAllDrives=True
         ).execute()
         
         # Make file publicly viewable
         drive_service.permissions().create(
             fileId=file['id'],
-            body={'type': 'anyone', 'role': 'reader'}
+            body={'type': 'anyone', 'role': 'reader'},
+            supportsAllDrives=True
         ).execute()
         
         return file.get('webViewLink'), file.get('id')
@@ -102,7 +104,10 @@ def delete_image_from_drive(image_id):
     """Delete image from Google Drive"""
     try:
         if image_id and image_id.strip():
-            drive_service.files().delete(fileId=image_id).execute()
+            drive_service.files().delete(
+                fileId=image_id,
+                supportsAllDrives=True
+            ).execute()
         return True
     except Exception as e:
         # Don't fail if image doesn't exist or already deleted
@@ -113,7 +118,10 @@ def download_image_from_drive(image_id):
     try:
         if not image_id or not image_id.strip():
             return None
-        request = drive_service.files().get_media(fileId=image_id)
+        request = drive_service.files().get_media(
+            fileId=image_id,
+            supportsAllDrives=True
+        )
         fh = io.BytesIO()
         downloader = MediaIoBaseDownload(fh, request)
         done = False
