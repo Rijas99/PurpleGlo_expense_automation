@@ -23,7 +23,7 @@ except ImportError:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "3.3.0"  # Version with Supabase cloud database support
+APP_VERSION = "3.4.0"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
@@ -749,6 +749,7 @@ def delete_receipt(ref: int) -> tuple[bool, str]:
     """
     Delete a receipt by its Ref number.
     Removes the row from the database and deletes the associated image file.
+    Also updates the CSV backup file to keep it in sync.
     Returns (success: bool, message: str)
     """
     try:
@@ -804,6 +805,15 @@ def delete_receipt(ref: int) -> tuple[bool, str]:
                         os.remove(full_image_path)
                     except Exception:
                         pass
+        
+        # Update CSV backup file to keep it in sync with database
+        try:
+            # Reload current data from database (after deletion)
+            remaining_df = load_data_for(None)
+            # Save to CSV to keep backup in sync
+            remaining_df.to_csv(DATA_FILE, index=False)
+        except Exception:
+            pass  # CSV update is optional, don't fail if it errors
 
         return True, f"Receipt {ref} deleted successfully."
 
