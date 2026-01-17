@@ -23,7 +23,7 @@ except ImportError:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "3.1"  # Version with Supabase cloud database support
+APP_VERSION = "3.2.0"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
@@ -1729,24 +1729,34 @@ with tab1:
                             supabase = get_supabase_client()
                             if supabase:
                                 try:
-                                    # Upload to Supabase Storage
-                                    file_data = uploaded_file.getbuffer()
-                                    supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+                                    # Upload to Supabase Storage - convert to bytes
+                                    # Reset file pointer to beginning
+                                    uploaded_file.seek(0)
+                                    file_data = uploaded_file.read()  # Read as bytes
+                                    
+                                    # Upload with correct file options format
+                                    response = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
                                         temp_filename,
                                         file_data,
-                                        file_options={"content-type": "image/jpeg"}
+                                        file_options={"contentType": "image/jpeg", "upsert": "true"}
                                     )
+                                    # Check if upload was successful
+                                    if response:
+                                        st.success("Image uploaded to Supabase Storage!")
                                 except Exception as e:
                                     st.error(f"Error uploading image to Supabase: {e}")
+                                    st.exception(e)  # Show full error for debugging
                                     # Fallback to local storage
+                                    uploaded_file.seek(0)  # Reset file pointer
                                     save_path = os.path.join(IMAGES_DIR, temp_filename)
                                     with open(save_path, "wb") as f:
-                                        f.write(uploaded_file.getbuffer())
+                                        f.write(uploaded_file.read())
                         else:
                             # Local storage (SQLite mode)
+                            uploaded_file.seek(0)  # Reset file pointer
                             save_path = os.path.join(IMAGES_DIR, temp_filename)
                             with open(save_path, "wb") as f:
-                                f.write(uploaded_file.getbuffer())
+                                f.write(uploaded_file.read())
 
                         df = load_data_for(None)
                         new_row = {
