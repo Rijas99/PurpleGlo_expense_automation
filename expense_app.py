@@ -9,7 +9,6 @@ import time as time_module
 import hashlib
 import sqlite3
 from datetime import datetime, time as dt_time
-from io import BytesIO
 from PIL import Image
 import google.generativeai as genai
 
@@ -24,7 +23,7 @@ except ImportError:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "3.6.0"  # Version with Supabase cloud database support
+APP_VERSION = "3.7.0"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
@@ -1649,22 +1648,8 @@ with tab1:
             key="receipt_upload",
         )
         if uploaded_file:
-            # Read file content once and store in memory for mobile compatibility
-            # This prevents issues when file is read multiple times
-            uploaded_file.seek(0)
-            file_bytes = uploaded_file.read()
-            uploaded_file.seek(0)  # Reset for image display
-            
-            # Store file bytes in session state for form submission
-            st.session_state["receipt_file_bytes"] = file_bytes
-            
-            # Create BytesIO object for reuse
-            file_buffer = BytesIO(file_bytes)
-            
-            st.image(file_buffer, caption="Receipt Preview", use_container_width=True)
-            
-            # Calculate hash from bytes
-            h = hashlib.sha256(file_bytes).hexdigest()
+            st.image(uploaded_file, caption="Receipt Preview", use_container_width=True)
+            h = file_hash(uploaded_file)
 
             # Automatically analyze receipt if not already cached
             if st.session_state.get("receipt_ai_hash") == h and st.session_state.get(
@@ -1673,10 +1658,9 @@ with tab1:
                 # Use cached result
                 ai_data = st.session_state.get("receipt_ai_data", {})
             else:
-                # Automatically trigger analysis - use BytesIO buffer
-                file_buffer.seek(0)  # Reset buffer for analysis
+                # Automatically trigger analysis
                 with st.spinner("Reading receipt with Gemini..."):
-                    ai_data = analyze_receipt_gemini(file_buffer)
+                    ai_data = analyze_receipt_gemini(uploaded_file)
                     if ai_data:
                         st.session_state["receipt_ai_data"] = ai_data
                         st.session_state["receipt_ai_hash"] = h
@@ -1815,21 +1799,21 @@ with tab1:
 
                         temp_filename = f"temp_{datetime.now().timestamp()}.jpg"
                         
-                        # Get file bytes from session state (stored when file was uploaded)
-                        file_bytes = st.session_state.get("receipt_file_bytes")
-                        if not file_bytes:
-                            st.error("File data not found. Please upload the image again.")
-                            st.stop()
-                        
                         # Save image to Supabase Storage or local filesystem
                         if USE_SUPABASE:
                             supabase = get_supabase_client()
                             if supabase:
                                 try:
-                                    # Upload to Supabase Storage using the file bytes from session state
+                                    # Upload to Supabase Storage - use getbuffer() for mobile compatibility
+                                    # getbuffer() returns memoryview that doesn't consume the stream
+                                    file_buffer = uploaded_file.getbuffer()
+                                    # Convert to bytes for Supabase (which expects bytes)
+                                    file_data = bytes(file_buffer)
+                                    
+                                    # Upload with correct file options format
                                     response = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
                                         temp_filename,
-                                        file_bytes,
+                                        file_data,
                                         file_options={"contentType": "image/jpeg", "upsert": "true"}
                                     )
                                     # Check if upload was successful
@@ -1838,15 +1822,17 @@ with tab1:
                                 except Exception as e:
                                     st.error(f"Error uploading image to Supabase: {e}")
                                     st.exception(e)  # Show full error for debugging
-                                    # Fallback to local storage
+                                    # Fallback to local storage - use getbuffer() for mobile compatibility
+                                    file_buffer = uploaded_file.getbuffer()
                                     save_path = os.path.join(IMAGES_DIR, temp_filename)
                                     with open(save_path, "wb") as f:
-                                        f.write(file_bytes)
+                                        f.write(bytes(file_buffer))
                         else:
-                            # Local storage (SQLite mode)
+                            # Local storage (SQLite mode) - use getbuffer() for mobile compatibility
+                            file_buffer = uploaded_file.getbuffer()
                             save_path = os.path.join(IMAGES_DIR, temp_filename)
                             with open(save_path, "wb") as f:
-                                f.write(file_bytes)
+                                f.write(bytes(file_buffer))
 
                         df = load_data_for(None)
                         # Calculate next Ref number: use max(Ref) + 1 if df is not empty, otherwise start at 1
@@ -1868,8 +1854,6 @@ with tab1:
                         # Clear form and photo after successful save
                         if "receipt_upload" in st.session_state:
                             del st.session_state["receipt_upload"]
-                        if "receipt_file_bytes" in st.session_state:
-                            del st.session_state["receipt_file_bytes"]
                         if "receipt_ai_hash" in st.session_state:
                             del st.session_state["receipt_ai_hash"]
                         if "receipt_ai_data" in st.session_state:
