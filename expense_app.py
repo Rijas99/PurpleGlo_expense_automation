@@ -23,7 +23,7 @@ except ImportError:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "3.4.0"  # Version with Supabase cloud database support
+APP_VERSION = "3.5.0"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
@@ -484,7 +484,8 @@ def trim_history_keep_last_n(n: int):
 def archive_current_month(report_month: str):
     """
     Archive current month data in database by updating month_slug, then copy images to archive folder.
-    Keep only last MAX_HISTORY_MONTHS archives.
+    Old archived data (older than 3 months) is kept in the database but separated by month_slug
+    to prevent mixing with current month data. Local archive folders may be cleaned up manually if needed.
     """
     ensure_current_dirs()
     month_slug = slugify(report_month)  # e.g. Jan_2026
@@ -595,8 +596,9 @@ def archive_current_month(report_month: str):
     # Just ensure images directory exists for new month
     os.makedirs(IMAGES_DIR, exist_ok=True)
 
-    # ✅ keep last 3 only
-    trim_history_keep_last_n(MAX_HISTORY_MONTHS)
+    # Note: Old archived data is kept in the database (separated by month_slug)
+    # to prevent mixing with current month. No automatic cleanup is performed.
+    # The trim_history_keep_last_n() function is available for manual cleanup if needed.
 
 
 def get_paths_for_month(selected_month_slug: str | None):
@@ -1832,8 +1834,10 @@ with tab1:
                                 f.write(uploaded_file.read())
 
                         df = load_data_for(None)
+                        # Calculate next Ref number: use max(Ref) + 1 if df is not empty, otherwise start at 1
+                        next_ref = int(df["Ref"].max()) + 1 if not df.empty and "Ref" in df.columns else 1
                         new_row = {
-                            "Ref": len(df) + 1,
+                            "Ref": next_ref,
                             "Date": formatted_date,
                             "Description": final_desc,
                             "Category": category,
