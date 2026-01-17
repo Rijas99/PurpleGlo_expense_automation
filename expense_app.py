@@ -1,107 +1,209 @@
 import streamlit as st
 import pandas as pd
 import os
+import shutil
 import json
+import stat
 import re
 import time as time_module
 import hashlib
+import sqlite3
 from datetime import datetime, time as dt_time
 from PIL import Image
 import google.generativeai as genai
 
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
-import io
+APP_VERSION = "1.0.0"  # Version with SQLite database persistence
 
-# =========================================================
-# APP INFO
-# =========================================================
-APP_VERSION = "v2.1.0 - Google Sheets + Drive Storage (No ZIP)"
-
-# =========================================================
-# SECRETS / CONFIG
-# =========================================================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
-SHEET_NAME = st.secrets.get("SHEET_NAME", "PurpleGlo_Expenses")
-DRIVE_FOLDER_ID = st.secrets.get("DRIVE_FOLDER_ID", "")
+WORK_DIR = "expense_workspace"
+CURRENT_DIR = os.path.join(WORK_DIR, "current")
+HISTORY_DIR = os.path.join(WORK_DIR, "history")
 
-# google_credentials must be in Streamlit secrets
-# [google_credentials] ... service account json fields ...
-credentials_dict = dict(st.secrets["google_credentials"])
+IMAGES_DIR = os.path.join(CURRENT_DIR, "images")
+# Database file - more persistent than CSV
+DB_FILE = os.path.join(WORK_DIR, "expenses.db")
+# Keep CSV file paths for backward compatibility and migration
+DATA_FILE = os.path.join(CURRENT_DIR, "data.csv")
+CREDIT_CARD_DATA_FILE = os.path.join(CURRENT_DIR, "credit_card_data.csv")
+TRANSPORT_DATA_FILE = os.path.join(CURRENT_DIR, "transport_data.csv")
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
-]
+MAX_HISTORY_MONTHS = 3  # ✅ keep only last 3 months
 
-creds = Credentials.from_service_account_info(credentials_dict, scopes=SCOPES)
-sheets_client = gspread.authorize(creds)
-drive_service = build("drive", "v3", credentials=creds)
+os.makedirs(IMAGES_DIR, exist_ok=True)
+os.makedirs(HISTORY_DIR, exist_ok=True)
+os.makedirs(WORK_DIR, exist_ok=True)
 
 # =========================================================
-# SHEET HEADERS
+# DATABASE FUNCTIONS
 # =========================================================
-RECEIPTS_HEADERS = [
-    "Report Month",
-    "Ref",
-    "Date",
-    "Description",
-    "Category",
-    "Project Code",
-    "Project Name",
-    "Amount",
-    "DriveFileId",
-    "DriveFileName",
-    "DriveLink",
-]
 
-CREDIT_HEADERS = [
-    "Report Month",
-    "Ref",
-    "Date",
-    "Description",
-    "Category",
-    "Project Code",
-    "Project Name",
-    "Amount",
-    "DriveFileId",
-    "DriveFileName",
-    "DriveLink",
-]
 
-TRANSPORT_HEADERS = [
-    "Report Month",
-    "Ref",
-    "Date",
-    "From",
-    "Destination",
-    "Return Included",
-    "Project Code",
-    "Project Name",
-]
+def get_db_connection():
+    """Get SQLite database connection."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-CATEGORY_OPTIONS = [
-    "Hotel Booking",
-    "Food & Beverages",
-    "Visa & Ticket",
-    "Parking",
-    "R & D Expenses",
-    "Subscriptions",
-    "Office - Tools & Consumables",
-    "Project - Consumables",
-    "Transportation",
-    "Project Expenses - Miscellaneous",
-    "Office Expenses - Miscellaneous",
-    "Can't classify",
-]
+
+def init_database():
+    """Initialize database tables if they don't exist."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Receipts table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            project_code TEXT,
+            project_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            original_image_path TEXT,
+            month_slug TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Credit card table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS credit_card (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            description TEXT NOT NULL,
+            category TEXT NOT NULL,
+            project_code TEXT,
+            project_name TEXT NOT NULL,
+            amount REAL NOT NULL,
+            month_slug TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Transport table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transport (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            from_location TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            return_included INTEGER NOT NULL DEFAULT 0,
+            project_code TEXT,
+            project_name TEXT NOT NULL,
+            month_slug TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Create indexes for better performance
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_receipts_month ON receipts(month_slug)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_receipts_ref ON receipts(ref)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cc_month ON credit_card(month_slug)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_transport_month ON transport(month_slug)")
+    
+    conn.commit()
+    conn.close()
+
+
+def migrate_csv_to_db():
+    """Migrate existing CSV data to database if CSV files exist but DB is empty."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if database has any data
+    cursor.execute("SELECT COUNT(*) FROM receipts")
+    receipts_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM credit_card")
+    cc_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM transport")
+    transport_count = cursor.fetchone()[0]
+    
+    # Only migrate if DB is empty and CSV files exist
+    if receipts_count == 0 and os.path.exists(DATA_FILE):
+        try:
+            df = pd.read_csv(DATA_FILE)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    cursor.execute("""
+                        INSERT INTO receipts (ref, date, description, category, project_code, project_name, amount, original_image_path, month_slug)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        int(row.get("Ref", 0)),
+                        str(row.get("Date", "")),
+                        str(row.get("Description", "")),
+                        str(row.get("Category", "")),
+                        str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                        str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                        float(row.get("Amount", 0)),
+                        str(row.get("Original_Image_Path", "")) if pd.notna(row.get("Original_Image_Path")) else "",
+                        None  # Current month
+                    ))
+                conn.commit()
+        except Exception as e:
+            pass  # Silently fail migration if CSV is corrupted
+    
+    if cc_count == 0 and os.path.exists(CREDIT_CARD_DATA_FILE):
+        try:
+            df = pd.read_csv(CREDIT_CARD_DATA_FILE)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    cursor.execute("""
+                        INSERT INTO credit_card (date, description, category, project_code, project_name, amount, month_slug)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        str(row.get("Date", "")),
+                        str(row.get("Description", "")),
+                        str(row.get("Category", "")),
+                        str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                        str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                        float(row.get("Amount", 0)),
+                        None  # Current month
+                    ))
+                conn.commit()
+        except Exception as e:
+            pass  # Silently fail migration if CSV is corrupted
+    
+    if transport_count == 0 and os.path.exists(TRANSPORT_DATA_FILE):
+        try:
+            df = pd.read_csv(TRANSPORT_DATA_FILE)
+            if not df.empty:
+                for _, row in df.iterrows():
+                    cursor.execute("""
+                        INSERT INTO transport (date, from_location, destination, return_included, project_code, project_name, month_slug)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        str(row.get("Date", "")),
+                        str(row.get("From", "")),
+                        str(row.get("Destination", "")),
+                        1 if row.get("Return Included", False) else 0,
+                        str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                        str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                        None  # Current month
+                    ))
+                conn.commit()
+        except Exception as e:
+            pass  # Silently fail migration if CSV is corrupted
+    
+    conn.close()
+
+
+# Initialize database on import
+init_database()
+migrate_csv_to_db()
+
 
 # =========================================================
 # HELPERS
 # =========================================================
+
+
 def slugify(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "_", text).strip("_")
 
@@ -117,12 +219,513 @@ def parse_retry_seconds(err_msg: str) -> int | None:
     return None
 
 
+def _remove_readonly(func, path, _excinfo):
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        raise
+
+
+def safe_rmtree(path, retries=5, delay=0.5):
+    if not os.path.exists(path):
+        return
+    last_err = None
+    for attempt in range(retries):
+        try:
+            shutil.rmtree(path, onerror=_remove_readonly)
+            return
+        except PermissionError as e:
+            last_err = e
+            if attempt < retries - 1:
+                time_module.sleep(delay)
+            else:
+                raise PermissionError(
+                    f"Cannot delete '{path}'. A file/folder is open.\n"
+                    f"Close File Explorer windows / Excel / Zip preview and try again."
+                ) from e
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time_module.sleep(delay)
+    if last_err:
+        raise last_err
+
+
+def ensure_current_dirs():
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+
+
+def month_folder_path(month_slug: str):
+    return os.path.join(HISTORY_DIR, month_slug)
+
+
+def list_archived_months():
+    if not os.path.exists(HISTORY_DIR):
+        return []
+    months = []
+    for name in os.listdir(HISTORY_DIR):
+        p = os.path.join(HISTORY_DIR, name)
+        if os.path.isdir(p):
+            months.append(name)
+    # sort by folder modified time (latest first)
+    months.sort(
+        key=lambda m: os.path.getmtime(os.path.join(HISTORY_DIR, m)), reverse=True
+    )
+    return months
+
+
+def trim_history_keep_last_n(n: int):
+    months = list_archived_months()
+    if len(months) <= n:
+        return
+    to_delete = months[n:]
+    for m in to_delete:
+        safe_rmtree(os.path.join(HISTORY_DIR, m))
+
+
+def archive_current_month(report_month: str):
+    """
+    Archive current month data in database by updating month_slug, then copy images to archive folder.
+    Keep only last MAX_HISTORY_MONTHS archives.
+    """
+    ensure_current_dirs()
+    month_slug = slugify(report_month)  # e.g. Jan_2026
+    target = month_folder_path(month_slug)
+
+    if os.path.exists(target):
+        raise RuntimeError(
+            f"Archive folder already exists: {month_slug}\n"
+            f"Change Report Month or delete that archive folder."
+        )
+
+    # Check if there's data to archive
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM receipts WHERE month_slug IS NULL")
+    receipts_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM credit_card WHERE month_slug IS NULL")
+    cc_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM transport WHERE month_slug IS NULL")
+    transport_count = cursor.fetchone()[0]
+    
+    if receipts_count == 0 and cc_count == 0 and transport_count == 0:
+        conn.close()
+        raise RuntimeError("No data to archive. Current month is empty.")
+    
+    # Update month_slug in database for all current month records
+    cursor.execute("UPDATE receipts SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
+    cursor.execute("UPDATE credit_card SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
+    cursor.execute("UPDATE transport SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
+    conn.commit()
+    conn.close()
+
+    # create target folder for images
+    os.makedirs(target, exist_ok=True)
+    os.makedirs(os.path.join(target, "images"), exist_ok=True)
+
+    # Export CSV files for backup (optional, for compatibility)
+    try:
+        receipts_df = load_data_for(month_slug)
+        if not receipts_df.empty:
+            receipts_df.to_csv(os.path.join(target, "data.csv"), index=False)
+        
+        cc_df = load_cc_for(month_slug)
+        if not cc_df.empty:
+            cc_df.to_csv(os.path.join(target, "credit_card_data.csv"), index=False)
+        
+        transport_df = load_transport_data(month_slug)
+        if not transport_df.empty:
+            transport_df.to_csv(os.path.join(target, "transport_data.csv"), index=False)
+    except Exception:
+        pass  # CSV export is optional
+
+    # copy images to archive
+    if os.path.exists(IMAGES_DIR):
+        # Get list of images that belong to archived receipts
+        receipts_df = load_data_for(month_slug)
+        archived_images = set()
+        if "Original_Image_Path" in receipts_df.columns:
+            archived_images = set(receipts_df["Original_Image_Path"].dropna().astype(str))
+        
+        # Copy archived images
+        for img_file in archived_images:
+            src = os.path.join(IMAGES_DIR, img_file)
+            if os.path.exists(src):
+                dst = os.path.join(target, "images", img_file)
+                try:
+                    shutil.copy(src, dst)
+                except Exception:
+                    pass
+        
+        # Clean up current images directory (keep only non-archived images)
+        # Actually, let's keep all images for now to avoid accidental deletion
+        # Images will be cleaned up naturally over time
+
+    # Clear current month data (images directory stays, but data is archived)
+    # Note: We don't delete CURRENT_DIR anymore since we're using database
+    # Just ensure images directory exists for new month
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+
+    # ✅ keep last 3 only
+    trim_history_keep_last_n(MAX_HISTORY_MONTHS)
+
+
+def get_paths_for_month(selected_month_slug: str | None):
+    if not selected_month_slug:  # CURRENT
+        base = CURRENT_DIR
+    else:
+        base = os.path.join(HISTORY_DIR, selected_month_slug)
+
+    images_dir = os.path.join(base, "images")
+    data_file = os.path.join(base, "data.csv")
+    cc_file = os.path.join(base, "credit_card_data.csv")
+    transport_file = os.path.join(base, "transport_data.csv")
+    return images_dir, data_file, cc_file, transport_file
+
+
+def load_data_for(selected_month_slug: str | None):
+    """Load receipts data from database."""
+    conn = get_db_connection()
+    
+    if selected_month_slug:
+        # Load archived month
+        query = "SELECT * FROM receipts WHERE month_slug = ? ORDER BY ref"
+        df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+    else:
+        # Load current month (month_slug is NULL)
+        query = "SELECT * FROM receipts WHERE month_slug IS NULL ORDER BY ref"
+        df = pd.read_sql_query(query, conn)
+    
+    conn.close()
+    
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Ref",
+                "Date",
+                "Description",
+                "Category",
+                "Project Code",
+                "Project Name",
+                "Amount",
+                "Original_Image_Path",
+            ]
+        )
+    
+    # Rename columns to match expected format
+    df = df.rename(columns={
+        "ref": "Ref",
+        "date": "Date",
+        "description": "Description",
+        "category": "Category",
+        "project_code": "Project Code",
+        "project_name": "Project Name",
+        "amount": "Amount",
+        "original_image_path": "Original_Image_Path"
+    })
+    
+    # Ensure Ref is integer
+    df["Ref"] = df["Ref"].astype(int)
+    
+    return df
+
+
+def save_data_current(df: pd.DataFrame):
+    """Save receipts data to database (current month)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Delete existing current month data
+    cursor.execute("DELETE FROM receipts WHERE month_slug IS NULL")
+    
+    # Insert new data
+    for _, row in df.iterrows():
+        cursor.execute("""
+            INSERT INTO receipts (ref, date, description, category, project_code, project_name, amount, original_image_path, month_slug)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(row.get("Ref", 0)),
+            str(row.get("Date", "")),
+            str(row.get("Description", "")),
+            str(row.get("Category", "")),
+            str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+            str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+            float(row.get("Amount", 0)),
+            str(row.get("Original_Image_Path", "")) if pd.notna(row.get("Original_Image_Path")) else "",
+            None  # Current month
+        ))
+    
+    conn.commit()
+    conn.close()
+    
+    # Also save to CSV for backup compatibility
+    try:
+        df.to_csv(DATA_FILE, index=False)
+    except Exception:
+        pass
+
+
+def delete_receipt(ref: int) -> tuple[bool, str]:
+    """
+    Delete a receipt by its Ref number.
+    Removes the row from the database and deletes the associated image file.
+    Returns (success: bool, message: str)
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Find the receipt with matching Ref in current month
+        cursor.execute("SELECT original_image_path FROM receipts WHERE ref = ? AND month_slug IS NULL", (ref,))
+        result = cursor.fetchone()
+        
+        if result is None:
+            conn.close()
+            return False, f"Receipt with Ref {ref} not found."
+
+        # Get the image path before deleting
+        image_path = result[0] if result[0] else None
+
+        # Delete from database
+        cursor.execute("DELETE FROM receipts WHERE ref = ? AND month_slug IS NULL", (ref,))
+        conn.commit()
+        conn.close()
+
+        # Delete the associated image file if it exists
+        if image_path:
+            full_image_path = os.path.join(IMAGES_DIR, str(image_path))
+            if os.path.exists(full_image_path):
+                try:
+                    os.remove(full_image_path)
+                except Exception as e:
+                    # Log but don't fail if image deletion fails
+                    pass
+
+        return True, f"Receipt {ref} deleted successfully."
+
+    except Exception as e:
+        return False, f"Error deleting receipt: {str(e)}"
+
+
+def load_cc_for(selected_month_slug: str | None):
+    """Load credit card data from database."""
+    conn = get_db_connection()
+    
+    if selected_month_slug:
+        # Load archived month
+        query = "SELECT * FROM credit_card WHERE month_slug = ? ORDER BY date"
+        df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+    else:
+        # Load current month (month_slug is NULL)
+        query = "SELECT * FROM credit_card WHERE month_slug IS NULL ORDER BY date"
+        df = pd.read_sql_query(query, conn)
+    
+    conn.close()
+    
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Date",
+                "Description",
+                "Category",
+                "Project Code",
+                "Project Name",
+                "Amount",
+            ]
+        )
+    
+    # Rename columns to match expected format
+    df = df.rename(columns={
+        "date": "Date",
+        "description": "Description",
+        "category": "Category",
+        "project_code": "Project Code",
+        "project_name": "Project Name",
+        "amount": "Amount"
+    })
+    
+    return df
+
+
+def save_cc_current(df: pd.DataFrame):
+    """Save credit card data to database (current month)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Delete existing current month data
+    cursor.execute("DELETE FROM credit_card WHERE month_slug IS NULL")
+    
+    # Insert new data
+    for _, row in df.iterrows():
+        cursor.execute("""
+            INSERT INTO credit_card (date, description, category, project_code, project_name, amount, month_slug)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(row.get("Date", "")),
+            str(row.get("Description", "")),
+            str(row.get("Category", "")),
+            str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+            str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+            float(row.get("Amount", 0)),
+            None  # Current month
+        ))
+    
+    conn.commit()
+    conn.close()
+    
+    # Also save to CSV for backup compatibility
+    try:
+        df.to_csv(CREDIT_CARD_DATA_FILE, index=False)
+    except Exception:
+        pass
+
+
+def load_transport_data(selected_month_slug: str | None = None):
+    """Load transport data from database for current or archived month."""
+    conn = get_db_connection()
+    
+    if selected_month_slug:
+        # Load archived month
+        query = "SELECT * FROM transport WHERE month_slug = ? ORDER BY date"
+        df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+    else:
+        # Load current month (month_slug is NULL)
+        query = "SELECT * FROM transport WHERE month_slug IS NULL ORDER BY date"
+        df = pd.read_sql_query(query, conn)
+    
+    conn.close()
+    
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Date",
+                "From",
+                "Destination",
+                "Return Included",
+                "Project Code",
+                "Project Name",
+            ]
+        )
+    
+    # Rename columns to match expected format
+    df = df.rename(columns={
+        "date": "Date",
+        "from_location": "From",
+        "destination": "Destination",
+        "return_included": "Return Included",
+        "project_code": "Project Code",
+        "project_name": "Project Name"
+    })
+    
+    # Convert return_included from int to boolean
+    df["Return Included"] = df["Return Included"].astype(bool)
+    
+    return df
+
+
+def save_transport_data(df: pd.DataFrame):
+    """Save transport data to database (current month)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Delete existing current month data
+    cursor.execute("DELETE FROM transport WHERE month_slug IS NULL")
+    
+    # Insert new data
+    for _, row in df.iterrows():
+        cursor.execute("""
+            INSERT INTO transport (date, from_location, destination, return_included, project_code, project_name, month_slug)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(row.get("Date", "")),
+            str(row.get("From", "")),
+            str(row.get("Destination", "")),
+            1 if row.get("Return Included", False) else 0,
+            str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+            str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+            None  # Current month
+        ))
+    
+    conn.commit()
+    conn.close()
+    
+    # Also save to CSV for backup compatibility
+    try:
+        df.to_csv(TRANSPORT_DATA_FILE, index=False)
+    except Exception:
+        pass
+
+
+def generate_transport_excel(df: pd.DataFrame, output_path: str):
+    """
+    Generate Excel file for transport expenses.
+    Columns: Date, From, Destination, Return Included, Project Code, Project Name
+    """
+    if df.empty:
+        st.warning("No transport expenses to export.")
+        return
+
+    # Create a new DataFrame with the required columns
+    excel_df = pd.DataFrame()
+    excel_df["Date"] = df["Date"]
+    excel_df["From"] = df["From"]
+    excel_df["Destination"] = df["Destination"]
+    # Convert boolean to "Return Included" or empty string
+    excel_df["Return Included"] = df["Return Included"].apply(
+        lambda x: "Return Included" if x else ""
+    )
+    excel_df["Project Code"] = df["Project Code"]
+    if "Project Name" in df.columns:
+        excel_df["Project Name"] = df["Project Name"].fillna("")
+
+    # Write to Excel
+    excel_df.to_excel(output_path, index=False, engine="openpyxl")
+
+
 def get_current_month_str(date_obj=None):
     if date_obj is None:
         date_obj = datetime.now()
     elif isinstance(date_obj, datetime):
         date_obj = date_obj.date()
     return date_obj.strftime("%b")
+
+
+def get_project_codes_for_month(
+    month_str=None, date_obj=None, include_credit_card=True
+):
+    if month_str is None:
+        month_str = get_current_month_str(date_obj)
+
+    all_codes = []
+    df = load_data_for(None)  # only from CURRENT for code suggestions
+    if not df.empty:
+        month_filter = df["Date"].str.contains(f"-{month_str}$", case=False, na=False)
+        month_data = df[month_filter]
+        for code in month_data["Project Code"].dropna():
+            code_str = str(code)
+            if code_str.endswith(".0") and code_str.replace(".0", "").isdigit():
+                code_str = code_str[:-2]
+            if code_str.strip():
+                all_codes.append(code_str)
+
+    if include_credit_card:
+        cc_df = load_cc_for(None)
+        if not cc_df.empty:
+            cc_month_filter = cc_df["Date"].str.contains(
+                f"-{month_str}$", case=False, na=False
+            )
+            cc_month_data = cc_df[cc_month_filter]
+            for code in cc_month_data["Project Code"].dropna():
+                code_str = str(code)
+                if code_str.endswith(".0") and code_str.replace(".0", "").isdigit():
+                    code_str = code_str[:-2]
+                if code_str.strip():
+                    all_codes.append(code_str)
+
+    return sorted(list(set(all_codes)))
 
 
 def get_meal_description(time_obj):
@@ -133,7 +736,7 @@ def get_meal_description(time_obj):
             try:
                 hour, minute = map(int, time_obj.split(":"))
                 time_obj = dt_time(hour, minute)
-            except Exception:
+            except:
                 time_obj = datetime.now().time()
         else:
             time_obj = datetime.now().time()
@@ -151,14 +754,20 @@ def _extract_json(text: str) -> dict:
     if not text:
         raise ValueError("Empty response from Gemini.")
 
+    # Remove markdown code blocks
     text = text.strip().replace("```json", "").replace("```", "").strip()
+
+    # Try direct JSON parsing first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
+    # Try a greedy approach - find content between first { and last }
+    # This handles nested objects and objects with arrays
     first_brace = text.find("{")
     last_brace = text.rfind("}")
+
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
         json_str = text[first_brace : last_brace + 1]
         try:
@@ -166,9 +775,13 @@ def _extract_json(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
+    # Try to find JSON object patterns (handle simple nested cases)
+    # Look for { followed by content and }
     json_pattern = r"\{(?:[^{}]|(?:\{[^{}]*\}))*\}"
     matches = re.findall(json_pattern, text, re.DOTALL)
+
     if matches:
+        # Try each match, starting with the longest (most likely to be complete)
         matches.sort(key=len, reverse=True)
         for match in matches:
             try:
@@ -176,145 +789,20 @@ def _extract_json(text: str) -> dict:
             except json.JSONDecodeError:
                 continue
 
-    raise ValueError(f"No valid JSON object found in Gemini response. Response: {text[:200]}")
-
-
-# =========================================================
-# GOOGLE SHEETS HELPERS
-# =========================================================
-def _open_sheet():
-    try:
-        return sheets_client.open(SHEET_NAME)
-    except Exception as e:
-        st.error(
-            f"Failed to open Google Sheet '{SHEET_NAME}'. "
-            f"Make sure the Sheet is shared with the service account email.\n\nError: {e}"
-        )
-        raise
-
-
-def get_worksheet(sheet_name: str, headers: list[str]):
-    sheet = _open_sheet()
-    try:
-        ws = sheet.worksheet(sheet_name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=sheet_name, rows="3000", cols="30")
-
-    # Ensure header row is correct
-    first_row = ws.row_values(1)
-    if first_row != headers:
-        ws.clear()
-        ws.append_row(headers)
-
-    return ws
-
-
-def load_df(sheet_name: str, headers: list[str]) -> pd.DataFrame:
-    try:
-        ws = get_worksheet(sheet_name, headers)
-        records = ws.get_all_records()
-        if not records:
-            return pd.DataFrame(columns=headers)
-        df = pd.DataFrame(records)
-        # Ensure all columns exist
-        for c in headers:
-            if c not in df.columns:
-                df[c] = ""
-        return df[headers].copy()
-    except Exception as e:
-        st.error(f"Failed to load '{sheet_name}' from Sheets: {e}")
-        return pd.DataFrame(columns=headers)
-
-
-def append_row(sheet_name: str, headers: list[str], row: dict) -> bool:
-    try:
-        ws = get_worksheet(sheet_name, headers)
-        ws.append_row([row.get(h, "") for h in headers], value_input_option="USER_ENTERED")
-        return True
-    except Exception as e:
-        st.error(f"Failed to append row to '{sheet_name}': {e}")
-        return False
-
-
-def delete_row_by_ref_and_month(sheet_name: str, headers: list[str], report_month: str, ref: int):
-    """
-    Deletes the first matching row where Report Month == report_month and Ref == ref.
-    Returns (success, message, drive_file_id)
-    """
-    try:
-        ws = get_worksheet(sheet_name, headers)
-        records = ws.get_all_records()
-
-        target_row_index = None
-        drive_file_id = ""
-
-        for i, r in enumerate(records, start=2):  # header is row 1
-            if str(r.get("Report Month", "")).strip() == str(report_month).strip() and str(r.get("Ref", "")).strip() == str(ref):
-                target_row_index = i
-                drive_file_id = str(r.get("DriveFileId", "")).strip()
-                break
-
-        if not target_row_index:
-            return False, f"Row not found: {report_month} Ref {ref}", ""
-
-        ws.delete_rows(target_row_index)
-        return True, f"Deleted: {report_month} Ref {ref}", drive_file_id
-
-    except Exception as e:
-        return False, f"Error deleting row: {e}", ""
-
-
-# =========================================================
-# GOOGLE DRIVE HELPERS
-# =========================================================
-def upload_image_to_drive(uploaded_file, report_month: str, ref: int) -> tuple[str, str, str]:
-    """
-    Upload image bytes to Drive folder.
-    Filename starts with Ref (sl number), per user requirement.
-    Returns (file_id, file_name, webViewLink)
-    """
-    if not DRIVE_FOLDER_ID:
-        raise RuntimeError("DRIVE_FOLDER_ID missing in Streamlit secrets.")
-
-    file_bytes = uploaded_file.getvalue()
-    month_slug = slugify(report_month)
-
-    # Filename begins with Ref. Also includes month to avoid confusion.
-    filename = f"{ref}_{month_slug}.jpg"
-
-    media = MediaIoBaseUpload(
-        io.BytesIO(file_bytes),
-        mimetype=uploaded_file.type or "image/jpeg",
-        resumable=False,
+    # If all else fails, raise with the actual response for debugging
+    raise ValueError(
+        f"No valid JSON object found in Gemini response. Response: {text[:200]}"
     )
 
-    meta = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-
-    created = drive_service.files().create(
-        body=meta,
-        media_body=media,
-        fields="id,name,webViewLink",
-    ).execute()
-
-    return created["id"], created["name"], created.get("webViewLink", "")
-
-
-def delete_drive_file(file_id: str):
-    if not file_id:
-        return
-    try:
-        drive_service.files().delete(fileId=file_id).execute()
-    except Exception:
-        # do not block delete if drive deletion fails
-        pass
-
 
 # =========================================================
-# GEMINI AI
+# GEMINI (button-based, cached, 429 retry once)
 # =========================================================
+
+
 def analyze_receipt_gemini(image_file):
     if not GOOGLE_API_KEY:
-        st.error("GOOGLE_API_KEY not set.")
+        st.error("GOOGLE_API_KEY not set. Add to .streamlit/secrets.toml or env var.")
         return None
 
     genai.configure(api_key=GOOGLE_API_KEY)
@@ -338,14 +826,31 @@ Example output format:
 
 Return ONLY the JSON object, no other text or explanation."""
 
-    generation_config = {"temperature": 0, "max_output_tokens": 1000}
+    # Optimize for speed: temperature=0 for faster deterministic responses,
+    # max_output_tokens set to allow for complete JSON responses (increased slightly for reliability)
+    generation_config = {
+        "temperature": 0,
+        "max_output_tokens": 1000,  # Increased to ensure complete JSON responses
+    }
 
     try:
-        response = model.generate_content([prompt, img], generation_config=generation_config)
+        response = model.generate_content(
+            [prompt, img], generation_config=generation_config
+        )
+
         if not response or not response.text:
             st.error("AI Error: Empty response from Gemini API.")
             return None
+
         return _extract_json(response.text)
+    except ValueError as e:
+        # JSON extraction error - show helpful message
+        error_msg = str(e)
+        st.error(f"AI Error: Failed to parse JSON from Gemini response. {error_msg}")
+        # Log the raw response for debugging (first 500 chars)
+        if "Response:" in error_msg:
+            st.code(error_msg.split("Response:")[1][:500], language="text")
+        return None
     except Exception as e:
         msg = str(e)
         if "429" in msg:
@@ -353,13 +858,15 @@ Return ONLY the JSON object, no other text or explanation."""
             st.warning(f"Rate limit hit. Waiting {wait_s}s then retrying once...")
             time_module.sleep(wait_s)
             try:
-                response = model.generate_content([prompt, img], generation_config=generation_config)
+                response = model.generate_content(
+                    [prompt, img], generation_config=generation_config
+                )
                 if not response or not response.text:
                     st.error("AI Error: Empty response from Gemini API on retry.")
                     return None
                 return _extract_json(response.text)
-            except Exception as e2:
-                st.error(f"AI Error on retry: {e2}")
+            except ValueError as ve:
+                st.error(f"AI Error: Failed to parse JSON on retry. {str(ve)}")
                 return None
         st.error(f"AI Error: {e}")
         return None
@@ -367,28 +874,25 @@ Return ONLY the JSON object, no other text or explanation."""
 
 def analyze_credit_card_statement(image_file):
     if not GOOGLE_API_KEY:
-        st.error("GOOGLE_API_KEY not set.")
+        st.error("GOOGLE_API_KEY not set. Add to .streamlit/secrets.toml or env var.")
         return None
 
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel("gemini-2.5-flash")
     img = Image.open(image_file)
 
-    prompt = """Analyze this credit card statement image. Extract TOTAL expense as JSON:
+    prompt = """
+Analyze this credit card statement image. Extract TOTAL expense as JSON:
 {"date":"YYYY-MM-DD","description":"...","amount":123.45,"category":"..."}
 Category must be one of:
 ["Hotel Booking","Food & Beverages","Visa & Ticket","Parking","R & D Expenses","Subscriptions",
 "Office - Tools & Consumables","Project - Consumables","Transportation",
 "Project Expenses - Miscellaneous","Office Expenses - Miscellaneous","Can't classify"]
 
-Return ONLY JSON."""
-
-    generation_config = {"temperature": 0, "max_output_tokens": 1000}
-
+Return ONLY JSON.
+"""
     try:
-        response = model.generate_content([prompt, img], generation_config=generation_config)
-        if not response or not response.text:
-            return None
+        response = model.generate_content([prompt, img])
         return _extract_json(response.text)
     except Exception as e:
         msg = str(e)
@@ -396,51 +900,101 @@ Return ONLY JSON."""
             wait_s = parse_retry_seconds(msg) or 30
             st.warning(f"Rate limit hit. Waiting {wait_s}s then retrying once...")
             time_module.sleep(wait_s)
-            response = model.generate_content([prompt, img], generation_config=generation_config)
+            response = model.generate_content([prompt, img])
             return _extract_json(response.text)
         st.error(f"AI Error: {e}")
         return None
 
 
 # =========================================================
-# BUSINESS LOGIC
+# REPORT GENERATION (exports selected month: CURRENT or archived)
 # =========================================================
-def get_next_ref_for_month(df: pd.DataFrame, report_month: str) -> int:
+
+
+def generate_receipts_package(report_month: str, selected_month_slug: str | None):
+    images_dir, data_file, _, _ = get_paths_for_month(selected_month_slug)
+    df = load_data_for(selected_month_slug)
+
     if df.empty:
-        return 1
-    m = df[df["Report Month"].astype(str).str.strip() == str(report_month).strip()]
-    if m.empty:
-        return 1
-    refs = pd.to_numeric(m["Ref"], errors="coerce").fillna(0).astype(int)
-    return int(refs.max()) + 1
+        st.error("No receipts expenses found for this month selection.")
+        return
+
+    month_slug = selected_month_slug if selected_month_slug else slugify(report_month)
+
+    output_folder = os.path.join(WORK_DIR, f"receipts_output_{month_slug}")
+    bills_folder = os.path.join(output_folder, f"bills_{month_slug}")
+
+    if os.path.exists(output_folder):
+        safe_rmtree(output_folder)
+    os.makedirs(bills_folder, exist_ok=True)
+
+    # copy images
+    if "Original_Image_Path" in df.columns:
+        for _, row in df.iterrows():
+            src = os.path.join(images_dir, str(row["Original_Image_Path"]))
+            if os.path.exists(src):
+                dst = os.path.join(bills_folder, f"{row['Ref']}.jpg")
+                shutil.copy(src, dst)
+
+    # excel export
+    excel_path = os.path.join(output_folder, f"Receipts_Expenses_{month_slug}.xlsx")
+    export_df = df.copy()
+    if "Original_Image_Path" in export_df.columns:
+        export_df = export_df.drop(columns=["Original_Image_Path"])
+    export_df.to_excel(excel_path, index=False)
+
+    zip_base = os.path.join(WORK_DIR, f"Receipts_Submission_{month_slug}")
+    zip_path = f"{zip_base}.zip"
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    shutil.make_archive(zip_base, "zip", output_folder)
+
+    st.success("Receipts package generated!")
+    with open(zip_path, "rb") as fp:
+        st.download_button(
+            "⬇️ Download Receipts ZIP",
+            fp,
+            file_name=f"Receipts_Submission_{month_slug}.zip",
+            mime="application/zip",
+        )
 
 
-def get_project_codes_for_month(report_month: str, include_credit_card=True):
-    codes = []
+def generate_credit_card_package(report_month: str, selected_month_slug: str | None):
+    cc_df = load_cc_for(selected_month_slug)
+    if cc_df.empty:
+        st.error("No credit card expenses found for this month selection.")
+        return
 
-    r_df = load_df("Receipts", RECEIPTS_HEADERS)
-    if not r_df.empty:
-        m = r_df[r_df["Report Month"].astype(str).str.strip() == str(report_month).strip()]
-        for c in m["Project Code"].dropna():
-            s = str(c).strip()
-            if s:
-                codes.append(s)
+    month_slug = selected_month_slug if selected_month_slug else slugify(report_month)
 
-    if include_credit_card:
-        cc_df = load_df("CreditCard", CREDIT_HEADERS)
-        if not cc_df.empty:
-            m2 = cc_df[cc_df["Report Month"].astype(str).str.strip() == str(report_month).strip()]
-            for c in m2["Project Code"].dropna():
-                s = str(c).strip()
-                if s:
-                    codes.append(s)
+    output_folder = os.path.join(WORK_DIR, f"credit_output_{month_slug}")
+    if os.path.exists(output_folder):
+        safe_rmtree(output_folder)
+    os.makedirs(output_folder, exist_ok=True)
 
-    return sorted(list(set(codes)))
+    excel_path = os.path.join(output_folder, f"CreditCard_Expenses_{month_slug}.xlsx")
+    cc_df.to_excel(excel_path, index=False)
+
+    zip_base = os.path.join(WORK_DIR, f"CreditCard_Submission_{month_slug}")
+    zip_path = f"{zip_base}.zip"
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    shutil.make_archive(zip_base, "zip", output_folder)
+
+    st.success("Credit card package generated!")
+    with open(zip_path, "rb") as fp:
+        st.download_button(
+            "⬇️ Download Credit Card ZIP",
+            fp,
+            file_name=f"CreditCard_Submission_{month_slug}.zip",
+            mime="application/zip",
+        )
 
 
 # =========================================================
 # UI
 # =========================================================
+
 st.set_page_config(
     page_title="PurpleGlo Expense Manager",
     layout="wide",
@@ -448,20 +1002,81 @@ st.set_page_config(
     menu_items=None,
 )
 
+# Mobile-friendly CSS
 st.markdown(
     """
     <style>
-    .stButton > button { min-height: 48px; font-size: 16px; }
+    /* Increase touch target sizes for mobile */
+    .stButton > button {
+        min-height: 48px;
+        font-size: 16px;
+    }
+    /* Make inputs larger and easier to tap */
     .stTextInput > div > div > input,
     .stNumberInput > div > div > input,
-    .stSelectbox > div > div > select { font-size: 16px; padding: 12px; }
-    .stDateInput > div > div > input { font-size: 16px; padding: 12px; }
-    .dataframe { overflow-x: auto; display: block; }
-    .version-badge {
-        position: fixed; bottom: 10px; right: 10px;
-        background: rgba(120, 120, 255, 0.85);
-        color: white; padding: 6px 10px; border-radius: 6px;
-        font-size: 12px; z-index: 1000;
+    .stSelectbox > div > div > select {
+        font-size: 16px;
+        padding: 12px;
+    }
+    /* Improve spacing on mobile */
+    .element-container {
+        margin-bottom: 1rem;
+    }
+    /* Make date picker more touch-friendly */
+    .stDateInput > div > div > input {
+        font-size: 16px;
+        padding: 12px;
+    }
+    /* Mobile-friendly table container with horizontal scroll */
+    .mobile-table-container {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        width: 100%;
+        margin: 1rem 0;
+    }
+    .mobile-table-container table {
+        width: 100%;
+        min-width: 600px;
+        border-collapse: collapse;
+        font-size: 14px;
+    }
+    .mobile-table-container th {
+        background-color: rgba(250, 250, 250, 0.1);
+        padding: 12px 8px;
+        text-align: left;
+        font-weight: 600;
+        border-bottom: 2px solid rgba(255, 255, 255, 0.2);
+        white-space: nowrap;
+    }
+    .mobile-table-container td {
+        padding: 12px 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        word-wrap: break-word;
+    }
+    .mobile-table-container tr:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+    }
+    /* Mobile-optimized delete button */
+    .mobile-delete-btn {
+        min-width: 48px;
+        min-height: 48px;
+        padding: 8px 12px;
+        font-size: 16px;
+    }
+    /* Responsive column widths */
+    @media (max-width: 768px) {
+        .mobile-table-container table {
+            font-size: 13px;
+        }
+        .mobile-table-container th,
+        .mobile-table-container td {
+            padding: 10px 6px;
+        }
+    }
+    /* Ensure table is scrollable on mobile */
+    .dataframe {
+        overflow-x: auto;
+        display: block;
     }
     </style>
     """,
@@ -469,445 +1084,709 @@ st.markdown(
 )
 
 st.title("🟣 PurpleGlo Expense Manager")
-st.markdown(f'<div class="version-badge">{APP_VERSION}</div>', unsafe_allow_html=True)
+st.caption(f"Version {APP_VERSION}")
 
 # Sidebar
 st.sidebar.header("Settings")
-report_month = st.sidebar.text_input("Report Month", value=datetime.now().strftime("%b %Y"))
-st.sidebar.write("Storage: Google Sheets + Google Drive ✅")
+st.sidebar.markdown(f"**🟣 Version {APP_VERSION}**")
+st.sidebar.markdown("---")
+report_month = st.sidebar.text_input(
+    "Report Month", value=datetime.now().strftime("%b %Y")
+)
+st.sidebar.write("Gemini API key loaded:", bool(GOOGLE_API_KEY))
 
-if not DRIVE_FOLDER_ID:
-    st.sidebar.error("Missing DRIVE_FOLDER_ID in secrets.")
+st.sidebar.divider()
 
-tab1, tab2, tab3 = st.tabs(["📸 Receipts", "💳 Credit Card", "🚗 Transportation"])
+archived = list_archived_months()
+month_view = st.sidebar.selectbox("View Month", options=["CURRENT"] + archived, index=0)
+selected_month_slug = None if month_view == "CURRENT" else month_view
 
+if month_view != "CURRENT":
+    st.sidebar.info(f"Viewing archived month: {month_view}")
+
+if st.sidebar.button("🗑️ Start New Month (Archive + Clear)"):
+    try:
+        archive_current_month(report_month)
+        st.success("Archived current month and started a new month.")
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(str(e))
+
+tab1, tab2, tab3 = st.tabs(["📸 Add Receipt", "💳 Credit Card", "🚗 Transportation"])
 
 # =========================================================
 # TAB 1: RECEIPTS
 # =========================================================
 with tab1:
-    st.subheader(f"Receipts ({report_month})")
+    st.subheader("Receipts")
 
-    df_all = load_df("Receipts", RECEIPTS_HEADERS)
-    df_view = df_all[df_all["Report Month"].astype(str).str.strip() == str(report_month).strip()].copy()
+    if month_view != "CURRENT":
+        st.warning(
+            "You are viewing archived data (read-only). Switch to CURRENT to add new receipts."
+        )
 
+    df_view = load_data_for(selected_month_slug)
     if not df_view.empty:
-        show_cols = ["Ref", "Date", "Description", "Category", "Project Code", "Project Name", "Amount"]
-        display_df = df_view[show_cols].copy()
-        display_df["Amount"] = pd.to_numeric(display_df["Amount"], errors="coerce").fillna(0.0)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.metric("Total Receipts", f"{display_df['Amount'].sum():.2f} SAR/AED")
+        # Prepare display dataframe with optimized column widths for mobile
+        # Check if Project Name column exists (for backward compatibility)
+        display_columns = ["Ref", "Date", "Description", "Category", "Project Code"]
+        if "Project Name" in df_view.columns:
+            display_columns.append("Project Name")
+        display_columns.append("Amount")
+
+        display_df = df_view[display_columns].copy()
+
+        # Format and truncate for mobile display
+        display_df["Amount"] = display_df["Amount"].apply(lambda x: f"{x:.2f}")
+        display_df["Description"] = display_df["Description"].apply(
+            lambda x: (str(x)[:35] + "...") if len(str(x)) > 35 else str(x)
+        )
+        display_df["Category"] = display_df["Category"].apply(
+            lambda x: (str(x)[:22] + "...") if len(str(x)) > 22 else str(x)
+        )
+        display_df["Project Code"] = display_df["Project Code"].apply(
+            lambda x: (str(x)[:18] + "...") if len(str(x)) > 18 else str(x)
+        )
+        if "Project Name" in display_df.columns:
+            display_df["Project Name"] = display_df["Project Name"].apply(
+                lambda x: (
+                    (str(x)[:20] + "...")
+                    if len(str(x)) > 20
+                    else str(x) if pd.notna(x) else ""
+                )
+            )
+
+        # Display scrollable table - st.dataframe handles mobile scrolling well
+        column_config = {
+            "Ref": st.column_config.NumberColumn("Ref", width="small"),
+            "Date": st.column_config.TextColumn("Date", width="small"),
+            "Description": st.column_config.TextColumn("Description", width="medium"),
+            "Category": st.column_config.TextColumn("Category", width="medium"),
+            "Project Code": st.column_config.TextColumn("Project Code", width="medium"),
+            "Amount": st.column_config.NumberColumn(
+                "Amount", width="small", format="%.2f"
+            ),
+        }
+        if "Project Name" in display_df.columns:
+            column_config["Project Name"] = st.column_config.TextColumn(
+                "Project Name", width="medium"
+            )
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+        )
+
+        # Delete buttons section - mobile-friendly grid layout
+        if month_view == "CURRENT":
+            st.divider()
+            st.write("**🗑️ Delete Receipts:**")
+            # Create responsive grid: 2 columns on mobile, 3-4 on larger screens
+            num_cols = (
+                min(3, len(df_view)) if len(df_view) > 3 else max(2, len(df_view))
+            )
+            delete_cols = st.columns(num_cols)
+
+            for idx, row in df_view.iterrows():
+                col_idx = idx % num_cols
+                ref_value = int(row["Ref"])
+                with delete_cols[col_idx]:
+                    if st.button(
+                        f"🗑️ Delete #{ref_value}",
+                        key=f"delete_receipt_{ref_value}",
+                        use_container_width=True,
+                        help=f"Delete receipt {ref_value}: {row['Description'][:25]}",
+                    ):
+                        success, message = delete_receipt(ref_value)
+                        if success:
+                            st.success(message)
+                            st.rerun()
+                        else:
+                            st.error(message)
+
+        st.metric("Total Receipts", f"{df_view['Amount'].sum():.2f} SAR/AED")
     else:
-        st.info("No receipt expenses for this month yet.")
+        st.info("No receipt expenses for this month selection.")
 
-    st.divider()
+    if month_view == "CURRENT":
+        uploaded_file = st.file_uploader(
+            "Upload Receipt (Camera or File)",
+            type=["jpg", "png", "jpeg"],
+            accept_multiple_files=False,
+            help="📷 Tap to take a photo with your camera or browse files",
+            key="receipt_upload",
+        )
+        if uploaded_file:
+            st.image(uploaded_file, caption="Receipt Preview", use_container_width=True)
+            h = file_hash(uploaded_file)
 
-    uploaded_file = st.file_uploader(
-        "Upload Receipt (Camera or File)",
-        type=["jpg", "png", "jpeg"],
-        accept_multiple_files=False,
-        help="Take photo or upload receipt image",
-        key="receipt_upload",
-    )
-
-    if uploaded_file:
-        st.image(uploaded_file, caption="Receipt Preview", use_container_width=True)
-        h = file_hash(uploaded_file)
-
-        # Auto analyze with Gemini (cached per image)
-        if st.session_state.get("receipt_ai_hash") == h and st.session_state.get("receipt_ai_data"):
-            ai_data = st.session_state.get("receipt_ai_data", {})
-        else:
-            with st.spinner("Reading receipt with Gemini..."):
-                ai_data = analyze_receipt_gemini(uploaded_file)
-                if ai_data:
-                    st.session_state["receipt_ai_data"] = ai_data
-                    st.session_state["receipt_ai_hash"] = h
-                    st.toast("Receipt analyzed successfully!")
-                else:
-                    ai_data = {}
-
-        default_date = datetime.today()
-        default_desc = ""
-        default_cat = "Project - Consumables"
-        default_amt = 0.0
-        default_time = None
-
-        if ai_data:
-            try:
-                default_date = datetime.strptime(ai_data.get("date"), "%Y-%m-%d")
-            except Exception:
-                pass
-            default_time = ai_data.get("time")
-            default_cat = ai_data.get("category", default_cat)
-            try:
-                default_amt = float(ai_data.get("amount", default_amt))
-            except Exception:
-                pass
-
-            if default_cat == "Food & Beverages":
-                default_desc = get_meal_description(default_time if default_time else datetime.now())
+            # Automatically analyze receipt if not already cached
+            if st.session_state.get("receipt_ai_hash") == h and st.session_state.get(
+                "receipt_ai_data"
+            ):
+                # Use cached result
+                ai_data = st.session_state.get("receipt_ai_data", {})
             else:
-                default_desc = ai_data.get("description", "")
+                # Automatically trigger analysis
+                with st.spinner("Reading receipt with Gemini..."):
+                    ai_data = analyze_receipt_gemini(uploaded_file)
+                    if ai_data:
+                        st.session_state["receipt_ai_data"] = ai_data
+                        st.session_state["receipt_ai_hash"] = h
+                        st.toast("Receipt analyzed successfully!")
+                    else:
+                        ai_data = {}
+            default_date = datetime.today()
+            default_desc = ""
+            default_cat = "Project - Consumables"
+            default_amt = 0.0
+            default_time = None
 
-        with st.form("receipt_form"):
-            c1, c2 = st.columns([1, 1])
+            if ai_data:
+                try:
+                    default_date = datetime.strptime(ai_data.get("date"), "%Y-%m-%d")
+                except:
+                    pass
+                default_time = ai_data.get("time")
+                default_cat = ai_data.get("category", default_cat)
+                try:
+                    default_amt = float(ai_data.get("amount", default_amt))
+                except:
+                    pass
 
-            with c1:
-                date_input = st.date_input("Date", value=default_date)
-                formatted_date = date_input.strftime("%d-%b")
-
-                cat_index = CATEGORY_OPTIONS.index(default_cat) if default_cat in CATEGORY_OPTIONS else 7
-                category = st.selectbox("Category", CATEGORY_OPTIONS, index=cat_index)
-
-                previous_codes = get_project_codes_for_month(report_month, include_credit_card=True)
-                code_options = ["Enter new project code..."] + previous_codes
-                selected_code_option = st.selectbox("Project Code", options=code_options, index=0)
-
-                if selected_code_option == "Enter new project code...":
-                    project_code = st.text_input("Enter New Project Code", placeholder="e.g., 250909-PDS-303")
+                if default_cat == "Food & Beverages":
+                    default_desc = get_meal_description(
+                        default_time if default_time else datetime.now()
+                    )
                 else:
-                    project_code = selected_code_option
+                    default_desc = ai_data.get("description", "")
 
-                project_name = st.text_input("Project Name *", placeholder="e.g., Project Alpha")
+            with st.form("receipt_form"):
+                # Use single column on mobile for better touch experience
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    date_input = st.date_input("Date", value=default_date)
+                    formatted_date = date_input.strftime("%d-%b")
 
-            with c2:
-                if category == "Food & Beverages":
-                    meal = get_meal_description(default_time if default_time else datetime.now())
-                    description = st.text_input("Description", value=default_desc or meal)
-                else:
-                    description = st.text_input("Description", value=default_desc)
+                    category_options = [
+                        "Hotel Booking",
+                        "Food & Beverages",
+                        "Visa & Ticket",
+                        "Parking",
+                        "R & D Expenses",
+                        "Subscriptions",
+                        "Office - Tools & Consumables",
+                        "Project - Consumables",
+                        "Transportation",
+                        "Project Expenses - Miscellaneous",
+                        "Office Expenses - Miscellaneous",
+                        "Can't classify",
+                    ]
+                    cat_index = (
+                        category_options.index(default_cat)
+                        if default_cat in category_options
+                        else 7
+                    )
+                    category = st.selectbox(
+                        "Category", category_options, index=cat_index
+                    )
 
-                amount = st.number_input("Amount (SAR/AED)", min_value=0.0, step=0.5, value=float(default_amt))
+                    current_month = get_current_month_str(date_input)
+                    previous_codes = get_project_codes_for_month(
+                        month_str=current_month
+                    )
+                    code_options = ["Enter new project code..."] + previous_codes
+                    selected_code_option = st.selectbox(
+                        "Project Code", options=code_options, index=0
+                    )
 
-                cap_to_40 = False
-                if category == "Food & Beverages":
-                    cap_to_40 = st.checkbox("Cap amount to 40 SAR/AED", value=False, key="cap_food_bill_checkbox")
+                    if selected_code_option == "Enter new project code...":
+                        project_code = st.text_input(
+                            "Enter New Project Code", placeholder="e.g., 250909-PDS-303"
+                        )
+                    else:
+                        project_code = selected_code_option
 
-            submitted = st.form_submit_button("✅ Save Receipt Expense", use_container_width=True)
+                    project_name = st.text_input(
+                        "Project Name *",
+                        placeholder="e.g., Project Alpha",
+                        help="Enter the project name (required)",
+                    )
 
-            if submitted:
-                final_project_name = (project_name or "").strip()
-                if not final_project_name:
-                    st.error("Project Name is required.")
-                else:
-                    final_desc = (description or "").strip()
+                with c2:
+                    if category == "Food & Beverages":
+                        meal = get_meal_description(
+                            default_time if default_time else datetime.now()
+                        )
+                        description = st.text_input(
+                            "Description", value=default_desc or meal
+                        )
+                    else:
+                        description = st.text_input("Description", value=default_desc)
+
+                    amount = st.number_input(
+                        "Amount (SAR/AED)",
+                        min_value=0.0,
+                        step=0.5,
+                        value=float(default_amt),
+                    )
+
+                    # Checkbox for capping food bills - only show for Food & Beverages
+                    cap_to_40 = False
+                    if category == "Food & Beverages":
+                        cap_to_40 = st.checkbox(
+                            "Cap amount to 40 SAR/AED",
+                            value=False,
+                            key="cap_food_bill_checkbox",
+                            help="If checked, amount will be capped at 40 and noted in description",
+                        )
+
+                submitted = st.form_submit_button(
+                    "✅ Save Receipt Expense", use_container_width=True
+                )
+
+                if submitted:
+                    final_desc = description.strip()
                     final_amt = float(amount)
+                    final_project_name = project_name.strip() if project_name else ""
 
-                    if category == "Food & Beverages" and cap_to_40 and final_amt > 40:
-                        final_desc = f"{final_desc} (capped at 40)"
-                        final_amt = 40.0
+                    # Validation
+                    if not final_project_name:
+                        st.error(
+                            "Project Name is required. Please enter a project name."
+                        )
+                    else:
+                        # Only cap if checkbox is checked, category is Food & Beverages, and amount > 40
+                        if (
+                            category == "Food & Beverages"
+                            and cap_to_40
+                            and final_amt > 40
+                        ):
+                            final_desc = f"{final_desc} (capped at 40)"
+                            final_amt = 40.0
+                            st.warning("Amount capped at 40")
 
-                    # Next Ref per month
-                    new_ref = get_next_ref_for_month(df_all, report_month)
+                        temp_filename = f"temp_{datetime.now().timestamp()}.jpg"
+                        save_path = os.path.join(IMAGES_DIR, temp_filename)
+                        with open(save_path, "wb") as f:
+                            f.write(uploaded_file.getbuffer())
 
-                    # Upload image to Drive
-                    try:
-                        with st.spinner("Uploading image to Google Drive..."):
-                            drive_id, drive_name, drive_link = upload_image_to_drive(uploaded_file, report_month, new_ref)
-                    except Exception as e:
-                        st.error(f"Drive upload failed: {e}")
-                        st.stop()
-
-                    row = {
-                        "Report Month": report_month,
-                        "Ref": new_ref,
-                        "Date": formatted_date,
-                        "Description": final_desc,
-                        "Category": category,
-                        "Project Code": project_code,
-                        "Project Name": final_project_name,
-                        "Amount": final_amt,
-                        "DriveFileId": drive_id,
-                        "DriveFileName": drive_name,
-                        "DriveLink": drive_link,
-                    }
-
-                    with st.spinner("Saving to Google Sheets..."):
-                        ok = append_row("Receipts", RECEIPTS_HEADERS, row)
-
-                    if ok:
+                        df = load_data_for(None)
+                        new_row = {
+                            "Ref": len(df) + 1,
+                            "Date": formatted_date,
+                            "Description": final_desc,
+                            "Category": category,
+                            "Project Code": project_code,
+                            "Project Name": final_project_name,
+                            "Amount": final_amt,
+                            "Original_Image_Path": temp_filename,
+                        }
+                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                        save_data_current(df)
                         st.success("Saved!")
-                        # Clear cached image analysis and uploader
-                        for k in ["receipt_upload", "receipt_ai_hash", "receipt_ai_data", "cap_food_bill_checkbox"]:
-                            if k in st.session_state:
-                                del st.session_state[k]
+
+                        # Clear form and photo after successful save
+                        if "receipt_upload" in st.session_state:
+                            del st.session_state["receipt_upload"]
+                        if "receipt_ai_hash" in st.session_state:
+                            del st.session_state["receipt_ai_hash"]
+                        if "receipt_ai_data" in st.session_state:
+                            del st.session_state["receipt_ai_data"]
+                        if "cap_food_bill_checkbox" in st.session_state:
+                            del st.session_state["cap_food_bill_checkbox"]
+
                         st.rerun()
 
     st.divider()
-    st.subheader("🗑️ Delete Receipts")
-    if not df_view.empty:
-        # Create buttons by Ref
-        refs = sorted(df_view["Ref"].astype(int).tolist())
-        cols = st.columns(3)
-        for i, ref in enumerate(refs):
-            with cols[i % 3]:
-                if st.button(f"Delete #{ref}", key=f"del_receipt_{ref}", use_container_width=True):
-                    success, msg, drive_id = delete_row_by_ref_and_month("Receipts", RECEIPTS_HEADERS, report_month, int(ref))
-                    if success:
-                        delete_drive_file(drive_id)
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-    else:
-        st.info("Nothing to delete for this month.")
-
+    st.subheader("📦 Generate Receipts Package")
+    st.write(f"Selected month: **{month_view}**")
+    if st.button("Generate Receipts ZIP", use_container_width=True):
+        try:
+            generate_receipts_package(report_month, selected_month_slug)
+        except Exception as e:
+            st.error("Failed to generate receipts package.")
+            st.exception(e)
 
 # =========================================================
 # TAB 2: CREDIT CARD
 # =========================================================
 with tab2:
-    st.subheader(f"Credit Card ({report_month})")
+    st.subheader("Credit Card")
 
-    cc_all = load_df("CreditCard", CREDIT_HEADERS)
-    cc_view = cc_all[cc_all["Report Month"].astype(str).str.strip() == str(report_month).strip()].copy()
+    if month_view != "CURRENT":
+        st.warning(
+            "You are viewing archived data (read-only). Switch to CURRENT to add new credit card expenses."
+        )
 
+    cc_view = load_cc_for(selected_month_slug)
     if not cc_view.empty:
-        show_cols = ["Ref", "Date", "Description", "Category", "Project Code", "Project Name", "Amount"]
-        display_df = cc_view[show_cols].copy()
-        display_df["Amount"] = pd.to_numeric(display_df["Amount"], errors="coerce").fillna(0.0)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-        st.metric("Total Credit Card", f"{display_df['Amount'].sum():.2f} SAR/AED")
+        # Prepare display columns with backward compatibility
+        display_columns = ["Date", "Description", "Category", "Project Code"]
+        if "Project Name" in cc_view.columns:
+            display_columns.append("Project Name")
+        display_columns.append("Amount")
+
+        st.dataframe(
+            cc_view[display_columns],
+            use_container_width=True,
+        )
+        st.metric("Total Credit Card", f"{cc_view['Amount'].sum():.2f} SAR/AED")
     else:
-        st.info("No credit card expenses for this month yet.")
+        st.info("No credit card expenses for this month selection.")
 
-    st.divider()
+    if month_view == "CURRENT":
+        uploaded_statement = st.file_uploader(
+            "Upload Credit Card Statement (Camera or File)",
+            type=["jpg", "png", "jpeg"],
+            accept_multiple_files=False,
+            help="📷 Tap to take a photo with your camera or browse files",
+            key="cc_upload",
+        )
 
-    uploaded_statement = st.file_uploader(
-        "Upload Credit Card Statement (Image)",
-        type=["jpg", "png", "jpeg"],
-        accept_multiple_files=False,
-        help="Upload statement image (will be saved to Drive)",
-        key="cc_upload",
-    )
+        ai_data = {}
+        if uploaded_statement:
+            st.image(
+                uploaded_statement,
+                caption="Statement Preview",
+                use_container_width=True,
+            )
+            h = file_hash(uploaded_statement)
 
-    ai_data = {}
-    if uploaded_statement:
-        st.image(uploaded_statement, caption="Statement Preview", use_container_width=True)
-        h = file_hash(uploaded_statement)
+            # Automatically analyze statement if not already cached
+            if st.session_state.get("cc_ai_hash") == h and st.session_state.get(
+                "cc_ai_data"
+            ):
+                # Use cached result
+                ai_data = st.session_state.get("cc_ai_data", {})
+            else:
+                # Automatically trigger analysis
+                with st.spinner("Reading statement with Gemini..."):
+                    data = analyze_credit_card_statement(uploaded_statement)
+                    if data:
+                        st.session_state["cc_ai_data"] = data
+                        st.session_state["cc_ai_hash"] = h
+                        st.toast("Statement analyzed successfully!")
+                        ai_data = data
+                    else:
+                        ai_data = {}
 
-        if st.session_state.get("cc_ai_hash") == h and st.session_state.get("cc_ai_data"):
-            ai_data = st.session_state.get("cc_ai_data", {})
-        else:
-            with st.spinner("Reading statement with Gemini..."):
-                data = analyze_credit_card_statement(uploaded_statement)
-                if data:
-                    st.session_state["cc_ai_data"] = data
-                    st.session_state["cc_ai_hash"] = h
-                    st.toast("Statement analyzed successfully!")
-                    ai_data = data
+        default_date = datetime.today()
+        default_desc = ""
+        default_cat = "Project - Consumables"
+        default_amt = 0.0
+
+        if ai_data:
+            try:
+                default_date = datetime.strptime(ai_data.get("date"), "%Y-%m-%d")
+            except:
+                pass
+            default_desc = ai_data.get("description", "")
+            default_cat = ai_data.get("category", default_cat)
+            try:
+                default_amt = float(ai_data.get("amount", 0.0))
+            except:
+                pass
+
+        with st.form("cc_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                date_input = st.date_input("Date", value=default_date)
+                formatted_date = date_input.strftime("%d-%b")
+
+                category_options = [
+                    "Hotel Booking",
+                    "Food & Beverages",
+                    "Visa & Ticket",
+                    "Parking",
+                    "R & D Expenses",
+                    "Subscriptions",
+                    "Office - Tools & Consumables",
+                    "Project - Consumables",
+                    "Transportation",
+                    "Project Expenses - Miscellaneous",
+                    "Office Expenses - Miscellaneous",
+                    "Can't classify",
+                ]
+                cat_index = (
+                    category_options.index(default_cat)
+                    if default_cat in category_options
+                    else 7
+                )
+                category = st.selectbox("Category", category_options, index=cat_index)
+
+                current_month = get_current_month_str(date_input)
+                previous_codes = get_project_codes_for_month(month_str=current_month)
+                code_options = ["Enter new project code..."] + previous_codes
+                selected_code_option = st.selectbox(
+                    "Project Code", options=code_options, index=0
+                )
+
+                if selected_code_option == "Enter new project code...":
+                    project_code = st.text_input(
+                        "Enter New Project Code", placeholder="e.g., 250909-PDS-303"
+                    )
                 else:
-                    ai_data = {}
+                    project_code = selected_code_option
 
-    default_date = datetime.today()
-    default_desc = ""
-    default_cat = "Project - Consumables"
-    default_amt = 0.0
+                project_name = st.text_input(
+                    "Project Name *",
+                    placeholder="e.g., Project Alpha",
+                    help="Enter the project name (required)",
+                )
 
-    if ai_data:
-        try:
-            default_date = datetime.strptime(ai_data.get("date"), "%Y-%m-%d")
-        except Exception:
-            pass
-        default_desc = ai_data.get("description", "")
-        default_cat = ai_data.get("category", default_cat)
-        try:
-            default_amt = float(ai_data.get("amount", 0.0))
-        except Exception:
-            pass
+            with c2:
+                description = st.text_input("Description", value=default_desc)
+                amount = st.number_input(
+                    "Amount (SAR/AED)",
+                    min_value=0.0,
+                    step=0.5,
+                    value=float(default_amt),
+                )
 
-    with st.form("cc_form"):
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            date_input = st.date_input("Date", value=default_date)
-            formatted_date = date_input.strftime("%d-%b")
+                # Checkbox for capping food bills - only show for Food & Beverages
+                cap_to_40 = False
+                if category == "Food & Beverages":
+                    cap_to_40 = st.checkbox(
+                        "Cap amount to 40 SAR/AED",
+                        value=False,
+                        key="cc_cap_food_bill_checkbox",
+                        help="If checked, amount will be capped at 40 and noted in description",
+                    )
 
-            cat_index = CATEGORY_OPTIONS.index(default_cat) if default_cat in CATEGORY_OPTIONS else 7
-            category = st.selectbox("Category", CATEGORY_OPTIONS, index=cat_index, key="cc_cat")
+            submitted = st.form_submit_button(
+                "✅ Save Credit Card Expense", use_container_width=True
+            )
 
-            previous_codes = get_project_codes_for_month(report_month, include_credit_card=True)
-            code_options = ["Enter new project code..."] + previous_codes
-            selected_code_option = st.selectbox("Project Code", options=code_options, index=0, key="cc_code_sel")
+            if submitted:
+                if not description.strip():
+                    st.error("Description required.")
+                elif not project_name.strip():
+                    st.error("Project Name is required. Please enter a project name.")
+                else:
+                    final_desc = description.strip()
+                    final_amt = float(amount)
+                    final_project_name = project_name.strip()
 
-            if selected_code_option == "Enter new project code...":
-                project_code = st.text_input("Enter New Project Code", placeholder="e.g., 250909-PDS-303", key="cc_code_new")
-            else:
-                project_code = selected_code_option
+                    # Only cap if checkbox is checked, category is Food & Beverages, and amount > 40
+                    if category == "Food & Beverages" and cap_to_40 and final_amt > 40:
+                        final_desc = f"{final_desc} (capped at 40)"
+                        final_amt = 40.0
+                        st.warning("Amount capped at 40")
 
-            project_name = st.text_input("Project Name *", placeholder="e.g., Project Alpha", key="cc_projname")
-
-        with c2:
-            description = st.text_input("Description", value=default_desc, key="cc_desc")
-            amount = st.number_input("Amount (SAR/AED)", min_value=0.0, step=0.5, value=float(default_amt), key="cc_amt")
-
-            cap_to_40 = False
-            if category == "Food & Beverages":
-                cap_to_40 = st.checkbox("Cap amount to 40 SAR/AED", value=False, key="cc_cap_food_bill_checkbox")
-
-        submitted = st.form_submit_button("✅ Save Credit Card Expense", use_container_width=True)
-
-        if submitted:
-            if not (project_name or "").strip():
-                st.error("Project Name is required.")
-            elif not (description or "").strip():
-                st.error("Description required.")
-            else:
-                final_desc = description.strip()
-                final_amt = float(amount)
-                final_project_name = project_name.strip()
-
-                if category == "Food & Beverages" and cap_to_40 and final_amt > 40:
-                    final_desc = f"{final_desc} (capped at 40)"
-                    final_amt = 40.0
-
-                new_ref = get_next_ref_for_month(cc_all, report_month)
-
-                # Statement image upload optional (but recommended)
-                drive_id = ""
-                drive_name = ""
-                drive_link = ""
-                if uploaded_statement:
-                    try:
-                        with st.spinner("Uploading statement to Google Drive..."):
-                            drive_id, drive_name, drive_link = upload_image_to_drive(uploaded_statement, report_month, new_ref)
-                    except Exception as e:
-                        st.error(f"Drive upload failed: {e}")
-                        st.stop()
-
-                row = {
-                    "Report Month": report_month,
-                    "Ref": new_ref,
-                    "Date": formatted_date,
-                    "Description": final_desc,
-                    "Category": category,
-                    "Project Code": project_code if project_code else "",
-                    "Project Name": final_project_name,
-                    "Amount": final_amt,
-                    "DriveFileId": drive_id,
-                    "DriveFileName": drive_name,
-                    "DriveLink": drive_link,
-                }
-
-                with st.spinner("Saving to Google Sheets..."):
-                    ok = append_row("CreditCard", CREDIT_HEADERS, row)
-
-                if ok:
+                    cc_df = load_cc_for(None)
+                    new_row = {
+                        "Date": formatted_date,
+                        "Description": final_desc,
+                        "Category": category,
+                        "Project Code": project_code if project_code else "",
+                        "Project Name": final_project_name,
+                        "Amount": final_amt,
+                    }
+                    cc_df = pd.concat(
+                        [cc_df, pd.DataFrame([new_row])], ignore_index=True
+                    )
+                    save_cc_current(cc_df)
                     st.success("Saved!")
-                    for k in ["cc_upload", "cc_ai_hash", "cc_ai_data", "cc_cap_food_bill_checkbox"]:
-                        if k in st.session_state:
-                            del st.session_state[k]
+
+                    # Clear form and photo after successful save
+                    if "cc_upload" in st.session_state:
+                        del st.session_state["cc_upload"]
+                    if "cc_ai_hash" in st.session_state:
+                        del st.session_state["cc_ai_hash"]
+                    if "cc_ai_data" in st.session_state:
+                        del st.session_state["cc_ai_data"]
+                    if "cc_cap_food_bill_checkbox" in st.session_state:
+                        del st.session_state["cc_cap_food_bill_checkbox"]
+
                     st.rerun()
 
     st.divider()
-    st.subheader("🗑️ Delete Credit Card Rows")
-    if not cc_view.empty:
-        refs = sorted(cc_view["Ref"].astype(int).tolist())
-        cols = st.columns(3)
-        for i, ref in enumerate(refs):
-            with cols[i % 3]:
-                if st.button(f"Delete #{ref}", key=f"del_cc_{ref}", use_container_width=True):
-                    success, msg, drive_id = delete_row_by_ref_and_month("CreditCard", CREDIT_HEADERS, report_month, int(ref))
-                    if success:
-                        delete_drive_file(drive_id)
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-    else:
-        st.info("Nothing to delete for this month.")
-
+    st.subheader("📦 Generate Credit Card Package")
+    st.write(f"Selected month: **{month_view}**")
+    if st.button("Generate Credit Card ZIP", use_container_width=True):
+        try:
+            generate_credit_card_package(report_month, selected_month_slug)
+        except Exception as e:
+            st.error("Failed to generate credit card package.")
+            st.exception(e)
 
 # =========================================================
 # TAB 3: TRANSPORTATION
 # =========================================================
 with tab3:
-    st.subheader(f"Transportation ({report_month})")
+    st.subheader("🚗 Transportation Expenses")
 
-    t_all = load_df("Transport", TRANSPORT_HEADERS)
-    t_view = t_all[t_all["Report Month"].astype(str).str.strip() == str(report_month).strip()].copy()
+    if month_view != "CURRENT":
+        st.warning(
+            f"⚠️ You are viewing archived month: **{month_view}**. "
+            "Switch to CURRENT to add new transportation expenses."
+        )
 
-    if not t_view.empty:
-        show_cols = ["Ref", "Date", "From", "Destination", "Return Included", "Project Code", "Project Name"]
-        display_df = t_view[show_cols].copy()
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No transport expenses for this month yet.")
-
-    st.divider()
-
+    # Form for Transportation Entry
     with st.form("transport_form"):
-        col1, col2 = st.columns([1, 1])
+        col1, col2 = st.columns(2)
 
         with col1:
             travel_date = st.date_input("Date *", value=datetime.today())
             formatted_date = travel_date.strftime("%d-%b")
-            from_location = st.text_input("From *", placeholder="e.g., Dubai, UAE")
-            destination = st.text_input("Destination *", placeholder="e.g., Abu Dhabi, UAE")
+
+            from_location = st.text_input(
+                "From *",
+                placeholder="e.g., Dubai, UAE",
+                help="Enter the origin location",
+            )
+
+            destination = st.text_input(
+                "Destination *",
+                placeholder="e.g., Abu Dhabi, UAE",
+                help="Enter the destination location",
+            )
 
         with col2:
-            return_included = st.checkbox("Return Included")
+            return_included = st.checkbox(
+                "Return Included",
+                help="Check if this trip includes return journey",
+            )
 
-            previous_codes = get_project_codes_for_month(report_month, include_credit_card=True)
+            # Project Code (optional)
+            current_month = get_current_month_str(travel_date)
+            previous_codes = get_project_codes_for_month(month_str=current_month)
             code_options = ["Enter new project code..."] + previous_codes
-            selected_code_option = st.selectbox("Project Code (Optional)", options=code_options, index=0, key="tr_code_sel")
+            selected_code_option = st.selectbox(
+                "Project Code (Optional)",
+                options=code_options,
+                index=0,
+                help="Select a previously used code or enter a new one",
+            )
 
             if selected_code_option == "Enter new project code...":
-                project_code = st.text_input("Enter New Project Code", placeholder="e.g., 250909-PDS-303", key="tr_code_new")
+                project_code = st.text_input(
+                    "Enter New Project Code",
+                    placeholder="e.g., 250909-PDS-303",
+                )
             else:
                 project_code = selected_code_option
 
-            project_name = st.text_input("Project Name *", placeholder="e.g., Project Alpha", key="tr_projname")
+            project_name = st.text_input(
+                "Project Name *",
+                placeholder="e.g., Project Alpha",
+                help="Enter the project name (required)",
+            )
 
-        submitted = st.form_submit_button("✅ Save Transportation Expense", use_container_width=True)
+        submitted = st.form_submit_button(
+            "✅ Save Transportation Expense", use_container_width=True
+        )
 
         if submitted:
+            # Validation
             errors = []
-            if not (from_location or "").strip():
+            if not from_location or not from_location.strip():
                 errors.append("Please enter From location")
-            if not (destination or "").strip():
+            if not destination or not destination.strip():
                 errors.append("Please enter Destination")
-            if not (project_name or "").strip():
+            if not project_name or not project_name.strip():
                 errors.append("Please enter Project Name")
 
             if errors:
-                for e in errors:
-                    st.error(e)
+                for error in errors:
+                    st.error(error)
             else:
-                new_ref = get_next_ref_for_month(t_all, report_month)
+                # Save to CSV
+                transport_df = load_transport_data(None)  # Load current month
 
-                row = {
-                    "Report Month": report_month,
-                    "Ref": new_ref,
+                new_row = {
                     "Date": formatted_date,
                     "From": from_location.strip(),
                     "Destination": destination.strip(),
-                    "Return Included": "Yes" if return_included else "No",
+                    "Return Included": return_included,
                     "Project Code": project_code if project_code else "",
                     "Project Name": project_name.strip(),
                 }
 
-                with st.spinner("Saving to Google Sheets..."):
-                    ok = append_row("Transport", TRANSPORT_HEADERS, row)
+                transport_df = pd.concat(
+                    [transport_df, pd.DataFrame([new_row])], ignore_index=True
+                )
+                save_transport_data(transport_df)
 
-                if ok:
-                    st.success("Transportation saved!")
-                    st.rerun()
+                st.success("Transportation expense saved!")
+                st.rerun()
 
+    # Display Current Month Transport Records
     st.divider()
-    st.subheader("🗑️ Delete Transport Rows")
-    if not t_view.empty:
-        refs = sorted(t_view["Ref"].astype(int).tolist())
-        cols = st.columns(3)
-        for i, ref in enumerate(refs):
-            with cols[i % 3]:
-                if st.button(f"Delete #{ref}", key=f"del_tr_{ref}", use_container_width=True):
-                    # Transport has no drive file
-                    success, msg, _ = delete_row_by_ref_and_month("Transport", TRANSPORT_HEADERS, report_month, int(ref))
-                    if success:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
+    st.subheader("Current Month Transportation Expenses")
+    transport_df = load_transport_data(selected_month_slug)
+
+    if not transport_df.empty:
+        # Filter by report month if needed
+        try:
+            report_month_obj = datetime.strptime(report_month, "%B %Y")
+            transport_df["Date_parsed"] = pd.to_datetime(
+                transport_df["Date"], format="%d-%b", errors="coerce"
+            )
+            month_filter = (
+                transport_df["Date_parsed"].dt.year == report_month_obj.year
+            ) & (transport_df["Date_parsed"].dt.month == report_month_obj.month)
+            month_transport = transport_df[month_filter].copy()
+            month_transport = month_transport.drop(columns=["Date_parsed"])
+        except:
+            # Fallback: show all if parsing fails
+            month_transport = transport_df.copy()
+
+        if not month_transport.empty:
+            # Prepare display dataframe with backward compatibility
+            display_columns = [
+                "Date",
+                "From",
+                "Destination",
+                "Return Included",
+                "Project Code",
+            ]
+            if "Project Name" in month_transport.columns:
+                display_columns.append("Project Name")
+
+            display_df = month_transport[display_columns].copy()
+
+            # Convert boolean to readable text
+            display_df["Return Included"] = display_df["Return Included"].apply(
+                lambda x: "Yes" if x else "No"
+            )
+
+            # Handle empty/null project codes
+            display_df["Project Code"] = (
+                display_df["Project Code"].fillna("").astype(str)
+            )
+            display_df["Project Code"] = display_df["Project Code"].apply(
+                lambda x: (
+                    x[:-2] if x.endswith(".0") and x.replace(".0", "").isdigit() else x
+                )
+            )
+
+            # Handle empty/null project names
+            if "Project Name" in display_df.columns:
+                display_df["Project Name"] = (
+                    display_df["Project Name"].fillna("").astype(str)
+                )
+
+            st.dataframe(display_df, use_container_width=True)
+
+            # Generate Excel button
+            st.divider()
+            st.subheader("Generate Report")
+            if st.button("📊 Generate Transportation Excel", use_container_width=True):
+                excel_path = "Transportation_Expenses.xlsx"
+                generate_transport_excel(month_transport, excel_path)
+                st.success("Excel file generated!")
+                with open(excel_path, "rb") as fp:
+                    st.download_button(
+                        "⬇️ Download Transportation Expenses Excel",
+                        fp,
+                        "Transportation_Expenses.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+        else:
+            st.info(f"No transport records found for {report_month}.")
     else:
-        st.info("Nothing to delete for this month.")
+        st.info("No transport records yet.")
