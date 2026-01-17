@@ -23,7 +23,7 @@ except ImportError:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "3.7.2"  # Version with Supabase cloud database support
+APP_VERSION = "3.5.0"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
@@ -1650,12 +1650,6 @@ with tab1:
         if uploaded_file:
             st.image(uploaded_file, caption="Receipt Preview", use_container_width=True)
             h = file_hash(uploaded_file)
-            
-            # Store file data in session state for mobile compatibility
-            # This ensures file is available after form submission
-            if "receipt_file_data" not in st.session_state or st.session_state.get("receipt_file_hash") != h:
-                st.session_state["receipt_file_data"] = uploaded_file.getvalue()
-                st.session_state["receipt_file_hash"] = h
 
             # Automatically analyze receipt if not already cached
             if st.session_state.get("receipt_ai_hash") == h and st.session_state.get(
@@ -1805,19 +1799,17 @@ with tab1:
 
                         temp_filename = f"temp_{datetime.now().timestamp()}.jpg"
                         
-                        # Get file data from session state (stored when file was uploaded)
-                        # This ensures file is available on mobile after form submission
-                        file_data = st.session_state.get("receipt_file_data")
-                        if not file_data:
-                            st.error("File data not found. Please upload the image again.")
-                            st.stop()
-                        
                         # Save image to Supabase Storage or local filesystem
                         if USE_SUPABASE:
                             supabase = get_supabase_client()
                             if supabase:
                                 try:
-                                    # Upload to Supabase Storage - file_data is already bytes from getvalue()
+                                    # Upload to Supabase Storage - convert to bytes
+                                    # Reset file pointer to beginning
+                                    uploaded_file.seek(0)
+                                    file_data = uploaded_file.read()  # Read as bytes
+                                    
+                                    # Upload with correct file options format
                                     response = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
                                         temp_filename,
                                         file_data,
@@ -1830,14 +1822,16 @@ with tab1:
                                     st.error(f"Error uploading image to Supabase: {e}")
                                     st.exception(e)  # Show full error for debugging
                                     # Fallback to local storage
+                                    uploaded_file.seek(0)  # Reset file pointer
                                     save_path = os.path.join(IMAGES_DIR, temp_filename)
                                     with open(save_path, "wb") as f:
-                                        f.write(file_data)
+                                        f.write(uploaded_file.read())
                         else:
-                            # Local storage (SQLite mode) - file_data is already bytes from getvalue()
+                            # Local storage (SQLite mode)
+                            uploaded_file.seek(0)  # Reset file pointer
                             save_path = os.path.join(IMAGES_DIR, temp_filename)
                             with open(save_path, "wb") as f:
-                                f.write(file_data)
+                                f.write(uploaded_file.read())
 
                         df = load_data_for(None)
                         # Calculate next Ref number: use max(Ref) + 1 if df is not empty, otherwise start at 1
@@ -1859,10 +1853,6 @@ with tab1:
                         # Clear form and photo after successful save
                         if "receipt_upload" in st.session_state:
                             del st.session_state["receipt_upload"]
-                        if "receipt_file_data" in st.session_state:
-                            del st.session_state["receipt_file_data"]
-                        if "receipt_file_hash" in st.session_state:
-                            del st.session_state["receipt_file_hash"]
                         if "receipt_ai_hash" in st.session_state:
                             del st.session_state["receipt_ai_hash"]
                         if "receipt_ai_data" in st.session_state:
