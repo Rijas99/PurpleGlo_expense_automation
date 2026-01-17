@@ -23,7 +23,7 @@ except ImportError:
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "3.2.0"  # Version with Supabase cloud database support
+APP_VERSION = "3.3.0"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
 
@@ -397,6 +397,67 @@ def month_folder_path(month_slug: str):
 
 
 def list_archived_months():
+    """List archived months from database (Supabase) or local folders (SQLite)."""
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return []
+        
+        try:
+            # Get distinct month_slug values from all three tables
+            months_set = set()
+            
+            # Query receipts table - get all records and filter for non-null month_slug
+            receipts_response = supabase.table("receipts").select("month_slug").execute()
+            if receipts_response.data:
+                for record in receipts_response.data:
+                    month_slug = record.get("month_slug")
+                    if month_slug and month_slug.strip():  # Non-null and non-empty
+                        months_set.add(month_slug)
+            
+            # Query credit_card table
+            cc_response = supabase.table("credit_card").select("month_slug").execute()
+            if cc_response.data:
+                for record in cc_response.data:
+                    month_slug = record.get("month_slug")
+                    if month_slug and month_slug.strip():
+                        months_set.add(month_slug)
+            
+            # Query transport table
+            transport_response = supabase.table("transport").select("month_slug").execute()
+            if transport_response.data:
+                for record in transport_response.data:
+                    month_slug = record.get("month_slug")
+                    if month_slug and month_slug.strip():
+                        months_set.add(month_slug)
+            
+            months = list(months_set)
+            
+            # Sort by parsing month_slug (e.g., "Jan_2026" -> datetime)
+            def parse_month_slug(slug):
+                try:
+                    # Format: "Jan_2026" -> datetime(2026, 1, 1)
+                    parts = slug.split("_")
+                    if len(parts) == 2:
+                        month_str, year_str = parts
+                        month_map = {
+                            "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+                            "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
+                        }
+                        month = month_map.get(month_str, 1)
+                        year = int(year_str)
+                        return datetime(year, month, 1)
+                except:
+                    # If parsing fails, return a very old date to put it at the end
+                    return datetime(1900, 1, 1)
+            
+            months.sort(key=parse_month_slug, reverse=True)
+            return months
+        except Exception:
+            # Fallback to local folders if Supabase query fails
+            pass
+    
+    # Local folder check (SQLite mode or Supabase fallback)
     if not os.path.exists(HISTORY_DIR):
         return []
     months = []
@@ -1488,70 +1549,70 @@ with tab1:
             display_columns.append("Project Name")
         display_columns.append("Amount")
 
-        display_df = df_view[display_columns].copy()
-
-        # Format and truncate for mobile display
-        display_df["Amount"] = display_df["Amount"].apply(lambda x: f"{x:.2f}")
-        display_df["Description"] = display_df["Description"].apply(
-            lambda x: (str(x)[:35] + "...") if len(str(x)) > 35 else str(x)
-        )
-        display_df["Category"] = display_df["Category"].apply(
-            lambda x: (str(x)[:22] + "...") if len(str(x)) > 22 else str(x)
-        )
-        display_df["Project Code"] = display_df["Project Code"].apply(
-            lambda x: (str(x)[:18] + "...") if len(str(x)) > 18 else str(x)
-        )
-        if "Project Name" in display_df.columns:
-            display_df["Project Name"] = display_df["Project Name"].apply(
-                lambda x: (
-                    (str(x)[:20] + "...")
-                    if len(str(x)) > 20
-                    else str(x) if pd.notna(x) else ""
-                )
-            )
-
-        # Display scrollable table - st.dataframe handles mobile scrolling well
-        column_config = {
-            "Ref": st.column_config.NumberColumn("Ref", width="small"),
-            "Date": st.column_config.TextColumn("Date", width="small"),
-            "Description": st.column_config.TextColumn("Description", width="medium"),
-            "Category": st.column_config.TextColumn("Category", width="medium"),
-            "Project Code": st.column_config.TextColumn("Project Code", width="medium"),
-            "Amount": st.column_config.NumberColumn(
-                "Amount", width="small", format="%.2f"
-            ),
-        }
-        if "Project Name" in display_df.columns:
-            column_config["Project Name"] = st.column_config.TextColumn(
-                "Project Name", width="medium"
-            )
-
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config=column_config,
-        )
-
-        # Delete buttons section - mobile-friendly grid layout
-        if month_view == "CURRENT":
-            st.divider()
-            st.write("**🗑️ Delete Receipts:**")
-            # Create responsive grid: 2 columns on mobile, 3-4 on larger screens
-            num_cols = (
-                min(3, len(df_view)) if len(df_view) > 3 else max(2, len(df_view))
-            )
-            delete_cols = st.columns(num_cols)
-
-            for idx, row in df_view.iterrows():
-                col_idx = idx % num_cols
-                ref_value = int(row["Ref"])
-                with delete_cols[col_idx]:
+        # Create custom table with inline delete buttons
+        # Determine column layout based on whether Project Name exists
+        has_project_name = "Project Name" in df_view.columns
+        num_cols = 8 if has_project_name else 7  # Ref, Date, Description, Category, Project Code, [Project Name], Amount, Delete
+        
+        # Create header row
+        header_cols = st.columns(num_cols)
+        header_cols[0].markdown("**Ref**")
+        header_cols[1].markdown("**Date**")
+        header_cols[2].markdown("**Description**")
+        header_cols[3].markdown("**Category**")
+        header_cols[4].markdown("**Project Code**")
+        col_idx = 5
+        if has_project_name:
+            header_cols[col_idx].markdown("**Project Name**")
+            col_idx += 1
+        header_cols[col_idx].markdown("**Amount**")
+        header_cols[col_idx + 1].markdown("**Delete**")
+        
+        st.divider()
+        
+        # Create data rows with inline delete buttons
+        for idx, row in df_view.iterrows():
+            row_cols = st.columns(num_cols)
+            ref_value = int(row["Ref"])
+            
+            # Format data for display
+            description = str(row["Description"])
+            if len(description) > 35:
+                description = description[:35] + "..."
+            
+            category = str(row["Category"])
+            if len(category) > 22:
+                category = category[:22] + "..."
+            
+            project_code = str(row["Project Code"]) if pd.notna(row["Project Code"]) else ""
+            if len(project_code) > 18:
+                project_code = project_code[:18] + "..."
+            
+            amount = f"{float(row['Amount']):.2f}"
+            
+            # Display data in columns
+            row_cols[0].write(str(ref_value))
+            row_cols[1].write(str(row["Date"]))
+            row_cols[2].write(description)
+            row_cols[3].write(category)
+            row_cols[4].write(project_code)
+            col_idx = 5
+            if has_project_name:
+                project_name = str(row["Project Name"]) if pd.notna(row["Project Name"]) else ""
+                if len(project_name) > 20:
+                    project_name = project_name[:20] + "..."
+                row_cols[col_idx].write(project_name)
+                col_idx += 1
+            row_cols[col_idx].write(amount)
+            
+            # Delete button in last column (only for CURRENT month)
+            if month_view == "CURRENT":
+                with row_cols[col_idx + 1]:
                     if st.button(
-                        f"🗑️ Delete #{ref_value}",
+                        "🗑️",
                         key=f"delete_receipt_{ref_value}",
-                        use_container_width=True,
                         help=f"Delete receipt {ref_value}: {row['Description'][:25]}",
+                        use_container_width=True,
                     ):
                         success, message = delete_receipt(ref_value)
                         if success:
@@ -1559,6 +1620,8 @@ with tab1:
                             st.rerun()
                         else:
                             st.error(message)
+            else:
+                row_cols[col_idx + 1].write("—")  # Show dash for archived months
 
         st.metric("Total Receipts", f"{df_view['Amount'].sum():.2f} SAR/AED")
     else:
