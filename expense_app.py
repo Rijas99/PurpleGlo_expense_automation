@@ -12,20 +12,35 @@ from datetime import datetime, time as dt_time
 from PIL import Image
 import google.generativeai as genai
 
+# Supabase imports (optional - fallback to SQLite if not available)
+try:
+    from supabase import create_client, Client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
-APP_VERSION = "1.0.0"  # Version with SQLite database persistence
+APP_VERSION = "3.1"  # Version with Supabase cloud database support
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
+
+# Supabase Configuration (for cloud deployment)
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL", ""))
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY", ""))
+SUPABASE_STORAGE_BUCKET = st.secrets.get("SUPABASE_STORAGE_BUCKET", os.environ.get("SUPABASE_STORAGE_BUCKET", "expense-images"))
+
+# Determine if we should use Supabase (if credentials are provided) or SQLite (local dev)
+USE_SUPABASE = SUPABASE_AVAILABLE and SUPABASE_URL and SUPABASE_KEY
 
 WORK_DIR = "expense_workspace"
 CURRENT_DIR = os.path.join(WORK_DIR, "current")
 HISTORY_DIR = os.path.join(WORK_DIR, "history")
 
 IMAGES_DIR = os.path.join(CURRENT_DIR, "images")
-# Database file - more persistent than CSV
+# Database file - SQLite fallback for local development
 DB_FILE = os.path.join(WORK_DIR, "expenses.db")
 # Keep CSV file paths for backward compatibility and migration
 DATA_FILE = os.path.join(CURRENT_DIR, "data.csv")
@@ -42,9 +57,23 @@ os.makedirs(WORK_DIR, exist_ok=True)
 # DATABASE FUNCTIONS
 # =========================================================
 
+# Initialize Supabase client (cached)
+@st.cache_resource
+def get_supabase_client():
+    """Get Supabase client instance."""
+    if not USE_SUPABASE:
+        return None
+    try:
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        st.error(f"Failed to connect to Supabase: {e}")
+        return None
+
 
 def get_db_connection():
-    """Get SQLite database connection."""
+    """Get SQLite database connection (fallback for local development)."""
+    if USE_SUPABASE:
+        return None  # Use Supabase instead
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
@@ -52,7 +81,28 @@ def get_db_connection():
 
 def init_database():
     """Initialize database tables if they don't exist."""
+    if USE_SUPABASE:
+        # For Supabase, tables should be created via SQL migration
+        # Just ensure storage bucket exists
+        supabase = get_supabase_client()
+        if supabase:
+            try:
+                # Try to create storage bucket if it doesn't exist
+                buckets = supabase.storage.list_buckets()
+                bucket_names = [b.name for b in buckets]
+                if SUPABASE_STORAGE_BUCKET not in bucket_names:
+                    try:
+                        supabase.storage.create_bucket(SUPABASE_STORAGE_BUCKET, {"public": False})
+                    except Exception:
+                        pass  # Bucket might already exist or creation failed
+            except Exception:
+                pass  # Storage might not be available or configured
+        return
+    
+    # SQLite initialization (local development)
     conn = get_db_connection()
+    if conn is None:
+        return
     cursor = conn.cursor()
     
     # Receipts table
@@ -114,7 +164,92 @@ def init_database():
 
 def migrate_csv_to_db():
     """Migrate existing CSV data to database if CSV files exist but DB is empty."""
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return
+        
+        # Check if database has any data
+        try:
+            receipts_result = supabase.table("receipts").select("id", count="exact").limit(1).execute()
+            receipts_count = receipts_result.count if hasattr(receipts_result, 'count') else len(receipts_result.data) if receipts_result.data else 0
+            
+            cc_result = supabase.table("credit_card").select("id", count="exact").limit(1).execute()
+            cc_count = cc_result.count if hasattr(cc_result, 'count') else len(cc_result.data) if cc_result.data else 0
+            
+            transport_result = supabase.table("transport").select("id", count="exact").limit(1).execute()
+            transport_count = transport_result.count if hasattr(transport_result, 'count') else len(transport_result.data) if transport_result.data else 0
+        except Exception:
+            return  # Tables might not exist yet
+        
+        # Only migrate if DB is empty and CSV files exist
+        if receipts_count == 0 and os.path.exists(DATA_FILE):
+            try:
+                df = pd.read_csv(DATA_FILE)
+                if not df.empty:
+                    records = []
+                    for _, row in df.iterrows():
+                        records.append({
+                            "ref": int(row.get("Ref", 0)),
+                            "date": str(row.get("Date", "")),
+                            "description": str(row.get("Description", "")),
+                            "category": str(row.get("Category", "")),
+                            "project_code": str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                            "project_name": str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                            "amount": float(row.get("Amount", 0)),
+                            "original_image_path": str(row.get("Original_Image_Path", "")) if pd.notna(row.get("Original_Image_Path")) else "",
+                            "month_slug": None
+                        })
+                    if records:
+                        supabase.table("receipts").insert(records).execute()
+            except Exception:
+                pass
+        
+        if cc_count == 0 and os.path.exists(CREDIT_CARD_DATA_FILE):
+            try:
+                df = pd.read_csv(CREDIT_CARD_DATA_FILE)
+                if not df.empty:
+                    records = []
+                    for _, row in df.iterrows():
+                        records.append({
+                            "date": str(row.get("Date", "")),
+                            "description": str(row.get("Description", "")),
+                            "category": str(row.get("Category", "")),
+                            "project_code": str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                            "project_name": str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                            "amount": float(row.get("Amount", 0)),
+                            "month_slug": None
+                        })
+                    if records:
+                        supabase.table("credit_card").insert(records).execute()
+            except Exception:
+                pass
+        
+        if transport_count == 0 and os.path.exists(TRANSPORT_DATA_FILE):
+            try:
+                df = pd.read_csv(TRANSPORT_DATA_FILE)
+                if not df.empty:
+                    records = []
+                    for _, row in df.iterrows():
+                        records.append({
+                            "date": str(row.get("Date", "")),
+                            "from_location": str(row.get("From", "")),
+                            "destination": str(row.get("Destination", "")),
+                            "return_included": 1 if row.get("Return Included", False) else 0,
+                            "project_code": str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                            "project_name": str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                            "month_slug": None
+                        })
+                    if records:
+                        supabase.table("transport").insert(records).execute()
+            except Exception:
+                pass
+        return
+    
+    # SQLite migration (local development)
     conn = get_db_connection()
+    if conn is None:
+        return
     cursor = conn.cursor()
     
     # Check if database has any data
@@ -301,26 +436,56 @@ def archive_current_month(report_month: str):
         )
 
     # Check if there's data to archive
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM receipts WHERE month_slug IS NULL")
-    receipts_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM credit_card WHERE month_slug IS NULL")
-    cc_count = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM transport WHERE month_slug IS NULL")
-    transport_count = cursor.fetchone()[0]
-    
-    if receipts_count == 0 and cc_count == 0 and transport_count == 0:
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            raise RuntimeError("Database connection failed.")
+        
+        try:
+            receipts_result = supabase.table("receipts").select("id", count="exact").is_("month_slug", "null").limit(1).execute()
+            receipts_count = receipts_result.count if hasattr(receipts_result, 'count') else len(receipts_result.data) if receipts_result.data else 0
+            
+            cc_result = supabase.table("credit_card").select("id", count="exact").is_("month_slug", "null").limit(1).execute()
+            cc_count = cc_result.count if hasattr(cc_result, 'count') else len(cc_result.data) if cc_result.data else 0
+            
+            transport_result = supabase.table("transport").select("id", count="exact").is_("month_slug", "null").limit(1).execute()
+            transport_count = transport_result.count if hasattr(transport_result, 'count') else len(transport_result.data) if transport_result.data else 0
+        except Exception:
+            receipts_count = cc_count = transport_count = 0
+        
+        if receipts_count == 0 and cc_count == 0 and transport_count == 0:
+            raise RuntimeError("No data to archive. Current month is empty.")
+        
+        # Update month_slug in database for all current month records
+        try:
+            supabase.table("receipts").update({"month_slug": month_slug}).is_("month_slug", "null").execute()
+            supabase.table("credit_card").update({"month_slug": month_slug}).is_("month_slug", "null").execute()
+            supabase.table("transport").update({"month_slug": month_slug}).is_("month_slug", "null").execute()
+        except Exception as e:
+            raise RuntimeError(f"Error archiving data: {e}")
+    else:
+        conn = get_db_connection()
+        if conn is None:
+            raise RuntimeError("Database connection failed.")
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM receipts WHERE month_slug IS NULL")
+        receipts_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM credit_card WHERE month_slug IS NULL")
+        cc_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM transport WHERE month_slug IS NULL")
+        transport_count = cursor.fetchone()[0]
+        
+        if receipts_count == 0 and cc_count == 0 and transport_count == 0:
+            conn.close()
+            raise RuntimeError("No data to archive. Current month is empty.")
+        
+        # Update month_slug in database for all current month records
+        cursor.execute("UPDATE receipts SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
+        cursor.execute("UPDATE credit_card SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
+        cursor.execute("UPDATE transport SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
+        conn.commit()
         conn.close()
-        raise RuntimeError("No data to archive. Current month is empty.")
-    
-    # Update month_slug in database for all current month records
-    cursor.execute("UPDATE receipts SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
-    cursor.execute("UPDATE credit_card SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
-    cursor.execute("UPDATE transport SET month_slug = ? WHERE month_slug IS NULL", (month_slug,))
-    conn.commit()
-    conn.close()
 
     # create target folder for images
     os.makedirs(target, exist_ok=True)
@@ -388,18 +553,36 @@ def get_paths_for_month(selected_month_slug: str | None):
 
 def load_data_for(selected_month_slug: str | None):
     """Load receipts data from database."""
-    conn = get_db_connection()
-    
-    if selected_month_slug:
-        # Load archived month
-        query = "SELECT * FROM receipts WHERE month_slug = ? ORDER BY ref"
-        df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return pd.DataFrame(columns=["Ref", "Date", "Description", "Category", "Project Code", "Project Name", "Amount", "Original_Image_Path"])
+        
+        try:
+            if selected_month_slug:
+                response = supabase.table("receipts").select("*").eq("month_slug", selected_month_slug).order("ref").execute()
+            else:
+                response = supabase.table("receipts").select("*").is_("month_slug", "null").order("ref").execute()
+            
+            if not response.data:
+                return pd.DataFrame(columns=["Ref", "Date", "Description", "Category", "Project Code", "Project Name", "Amount", "Original_Image_Path"])
+            
+            df = pd.DataFrame(response.data)
+        except Exception:
+            return pd.DataFrame(columns=["Ref", "Date", "Description", "Category", "Project Code", "Project Name", "Amount", "Original_Image_Path"])
     else:
-        # Load current month (month_slug is NULL)
-        query = "SELECT * FROM receipts WHERE month_slug IS NULL ORDER BY ref"
-        df = pd.read_sql_query(query, conn)
-    
-    conn.close()
+        conn = get_db_connection()
+        if conn is None:
+            return pd.DataFrame(columns=["Ref", "Date", "Description", "Category", "Project Code", "Project Name", "Amount", "Original_Image_Path"])
+        
+        if selected_month_slug:
+            query = "SELECT * FROM receipts WHERE month_slug = ? ORDER BY ref"
+            df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+        else:
+            query = "SELECT * FROM receipts WHERE month_slug IS NULL ORDER BY ref"
+            df = pd.read_sql_query(query, conn)
+        
+        conn.close()
     
     if df.empty:
         return pd.DataFrame(
@@ -428,38 +611,71 @@ def load_data_for(selected_month_slug: str | None):
     })
     
     # Ensure Ref is integer
-    df["Ref"] = df["Ref"].astype(int)
+    if "Ref" in df.columns:
+        df["Ref"] = df["Ref"].astype(int)
     
     return df
 
 
 def save_data_current(df: pd.DataFrame):
     """Save receipts data to database (current month)."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Delete existing current month data
-    cursor.execute("DELETE FROM receipts WHERE month_slug IS NULL")
-    
-    # Insert new data
-    for _, row in df.iterrows():
-        cursor.execute("""
-            INSERT INTO receipts (ref, date, description, category, project_code, project_name, amount, original_image_path, month_slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            int(row.get("Ref", 0)),
-            str(row.get("Date", "")),
-            str(row.get("Description", "")),
-            str(row.get("Category", "")),
-            str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
-            str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
-            float(row.get("Amount", 0)),
-            str(row.get("Original_Image_Path", "")) if pd.notna(row.get("Original_Image_Path")) else "",
-            None  # Current month
-        ))
-    
-    conn.commit()
-    conn.close()
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return
+        
+        try:
+            # Delete existing current month data
+            supabase.table("receipts").delete().is_("month_slug", "null").execute()
+            
+            # Prepare records for insertion
+            records = []
+            for _, row in df.iterrows():
+                records.append({
+                    "ref": int(row.get("Ref", 0)),
+                    "date": str(row.get("Date", "")),
+                    "description": str(row.get("Description", "")),
+                    "category": str(row.get("Category", "")),
+                    "project_code": str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                    "project_name": str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                    "amount": float(row.get("Amount", 0)),
+                    "original_image_path": str(row.get("Original_Image_Path", "")) if pd.notna(row.get("Original_Image_Path")) else "",
+                    "month_slug": None
+                })
+            
+            # Insert new data
+            if records:
+                supabase.table("receipts").insert(records).execute()
+        except Exception as e:
+            st.error(f"Error saving to Supabase: {e}")
+    else:
+        conn = get_db_connection()
+        if conn is None:
+            return
+        cursor = conn.cursor()
+        
+        # Delete existing current month data
+        cursor.execute("DELETE FROM receipts WHERE month_slug IS NULL")
+        
+        # Insert new data
+        for _, row in df.iterrows():
+            cursor.execute("""
+                INSERT INTO receipts (ref, date, description, category, project_code, project_name, amount, original_image_path, month_slug)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                int(row.get("Ref", 0)),
+                str(row.get("Date", "")),
+                str(row.get("Description", "")),
+                str(row.get("Category", "")),
+                str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                float(row.get("Amount", 0)),
+                str(row.get("Original_Image_Path", "")) if pd.notna(row.get("Original_Image_Path")) else "",
+                None  # Current month
+            ))
+        
+        conn.commit()
+        conn.close()
     
     # Also save to CSV for backup compatibility
     try:
@@ -475,34 +691,58 @@ def delete_receipt(ref: int) -> tuple[bool, str]:
     Returns (success: bool, message: str)
     """
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Find the receipt with matching Ref in current month
-        cursor.execute("SELECT original_image_path FROM receipts WHERE ref = ? AND month_slug IS NULL", (ref,))
-        result = cursor.fetchone()
-        
-        if result is None:
-            conn.close()
-            return False, f"Receipt with Ref {ref} not found."
-
-        # Get the image path before deleting
-        image_path = result[0] if result[0] else None
-
-        # Delete from database
-        cursor.execute("DELETE FROM receipts WHERE ref = ? AND month_slug IS NULL", (ref,))
-        conn.commit()
-        conn.close()
-
-        # Delete the associated image file if it exists
-        if image_path:
-            full_image_path = os.path.join(IMAGES_DIR, str(image_path))
-            if os.path.exists(full_image_path):
+        if USE_SUPABASE:
+            supabase = get_supabase_client()
+            if not supabase:
+                return False, "Database connection failed."
+            
+            # Find the receipt with matching Ref in current month
+            response = supabase.table("receipts").select("original_image_path").eq("ref", ref).is_("month_slug", "null").execute()
+            
+            if not response.data:
+                return False, f"Receipt with Ref {ref} not found."
+            
+            image_path = response.data[0].get("original_image_path") if response.data[0].get("original_image_path") else None
+            
+            # Delete from database
+            supabase.table("receipts").delete().eq("ref", ref).is_("month_slug", "null").execute()
+            
+            # Delete image from Supabase Storage if it exists
+            if image_path:
                 try:
-                    os.remove(full_image_path)
-                except Exception as e:
-                    # Log but don't fail if image deletion fails
-                    pass
+                    supabase.storage.from_(SUPABASE_STORAGE_BUCKET).remove([image_path])
+                except Exception:
+                    pass  # Image might not exist in storage
+        else:
+            conn = get_db_connection()
+            if conn is None:
+                return False, "Database connection failed."
+            cursor = conn.cursor()
+            
+            # Find the receipt with matching Ref in current month
+            cursor.execute("SELECT original_image_path FROM receipts WHERE ref = ? AND month_slug IS NULL", (ref,))
+            result = cursor.fetchone()
+            
+            if result is None:
+                conn.close()
+                return False, f"Receipt with Ref {ref} not found."
+
+            # Get the image path before deleting
+            image_path = result[0] if result[0] else None
+
+            # Delete from database
+            cursor.execute("DELETE FROM receipts WHERE ref = ? AND month_slug IS NULL", (ref,))
+            conn.commit()
+            conn.close()
+
+            # Delete the associated image file if it exists
+            if image_path:
+                full_image_path = os.path.join(IMAGES_DIR, str(image_path))
+                if os.path.exists(full_image_path):
+                    try:
+                        os.remove(full_image_path)
+                    except Exception:
+                        pass
 
         return True, f"Receipt {ref} deleted successfully."
 
@@ -512,18 +752,36 @@ def delete_receipt(ref: int) -> tuple[bool, str]:
 
 def load_cc_for(selected_month_slug: str | None):
     """Load credit card data from database."""
-    conn = get_db_connection()
-    
-    if selected_month_slug:
-        # Load archived month
-        query = "SELECT * FROM credit_card WHERE month_slug = ? ORDER BY date"
-        df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return pd.DataFrame(columns=["Date", "Description", "Category", "Project Code", "Project Name", "Amount"])
+        
+        try:
+            if selected_month_slug:
+                response = supabase.table("credit_card").select("*").eq("month_slug", selected_month_slug).order("date").execute()
+            else:
+                response = supabase.table("credit_card").select("*").is_("month_slug", "null").order("date").execute()
+            
+            if not response.data:
+                return pd.DataFrame(columns=["Date", "Description", "Category", "Project Code", "Project Name", "Amount"])
+            
+            df = pd.DataFrame(response.data)
+        except Exception:
+            return pd.DataFrame(columns=["Date", "Description", "Category", "Project Code", "Project Name", "Amount"])
     else:
-        # Load current month (month_slug is NULL)
-        query = "SELECT * FROM credit_card WHERE month_slug IS NULL ORDER BY date"
-        df = pd.read_sql_query(query, conn)
-    
-    conn.close()
+        conn = get_db_connection()
+        if conn is None:
+            return pd.DataFrame(columns=["Date", "Description", "Category", "Project Code", "Project Name", "Amount"])
+        
+        if selected_month_slug:
+            query = "SELECT * FROM credit_card WHERE month_slug = ? ORDER BY date"
+            df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+        else:
+            query = "SELECT * FROM credit_card WHERE month_slug IS NULL ORDER BY date"
+            df = pd.read_sql_query(query, conn)
+        
+        conn.close()
     
     if df.empty:
         return pd.DataFrame(
@@ -552,29 +810,59 @@ def load_cc_for(selected_month_slug: str | None):
 
 def save_cc_current(df: pd.DataFrame):
     """Save credit card data to database (current month)."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Delete existing current month data
-    cursor.execute("DELETE FROM credit_card WHERE month_slug IS NULL")
-    
-    # Insert new data
-    for _, row in df.iterrows():
-        cursor.execute("""
-            INSERT INTO credit_card (date, description, category, project_code, project_name, amount, month_slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(row.get("Date", "")),
-            str(row.get("Description", "")),
-            str(row.get("Category", "")),
-            str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
-            str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
-            float(row.get("Amount", 0)),
-            None  # Current month
-        ))
-    
-    conn.commit()
-    conn.close()
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return
+        
+        try:
+            # Delete existing current month data
+            supabase.table("credit_card").delete().is_("month_slug", "null").execute()
+            
+            # Prepare records for insertion
+            records = []
+            for _, row in df.iterrows():
+                records.append({
+                    "date": str(row.get("Date", "")),
+                    "description": str(row.get("Description", "")),
+                    "category": str(row.get("Category", "")),
+                    "project_code": str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                    "project_name": str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                    "amount": float(row.get("Amount", 0)),
+                    "month_slug": None
+                })
+            
+            # Insert new data
+            if records:
+                supabase.table("credit_card").insert(records).execute()
+        except Exception as e:
+            st.error(f"Error saving to Supabase: {e}")
+    else:
+        conn = get_db_connection()
+        if conn is None:
+            return
+        cursor = conn.cursor()
+        
+        # Delete existing current month data
+        cursor.execute("DELETE FROM credit_card WHERE month_slug IS NULL")
+        
+        # Insert new data
+        for _, row in df.iterrows():
+            cursor.execute("""
+                INSERT INTO credit_card (date, description, category, project_code, project_name, amount, month_slug)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(row.get("Date", "")),
+                str(row.get("Description", "")),
+                str(row.get("Category", "")),
+                str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                float(row.get("Amount", 0)),
+                None  # Current month
+            ))
+        
+        conn.commit()
+        conn.close()
     
     # Also save to CSV for backup compatibility
     try:
@@ -585,18 +873,36 @@ def save_cc_current(df: pd.DataFrame):
 
 def load_transport_data(selected_month_slug: str | None = None):
     """Load transport data from database for current or archived month."""
-    conn = get_db_connection()
-    
-    if selected_month_slug:
-        # Load archived month
-        query = "SELECT * FROM transport WHERE month_slug = ? ORDER BY date"
-        df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return pd.DataFrame(columns=["Date", "From", "Destination", "Return Included", "Project Code", "Project Name"])
+        
+        try:
+            if selected_month_slug:
+                response = supabase.table("transport").select("*").eq("month_slug", selected_month_slug).order("date").execute()
+            else:
+                response = supabase.table("transport").select("*").is_("month_slug", "null").order("date").execute()
+            
+            if not response.data:
+                return pd.DataFrame(columns=["Date", "From", "Destination", "Return Included", "Project Code", "Project Name"])
+            
+            df = pd.DataFrame(response.data)
+        except Exception:
+            return pd.DataFrame(columns=["Date", "From", "Destination", "Return Included", "Project Code", "Project Name"])
     else:
-        # Load current month (month_slug is NULL)
-        query = "SELECT * FROM transport WHERE month_slug IS NULL ORDER BY date"
-        df = pd.read_sql_query(query, conn)
-    
-    conn.close()
+        conn = get_db_connection()
+        if conn is None:
+            return pd.DataFrame(columns=["Date", "From", "Destination", "Return Included", "Project Code", "Project Name"])
+        
+        if selected_month_slug:
+            query = "SELECT * FROM transport WHERE month_slug = ? ORDER BY date"
+            df = pd.read_sql_query(query, conn, params=(selected_month_slug,))
+        else:
+            query = "SELECT * FROM transport WHERE month_slug IS NULL ORDER BY date"
+            df = pd.read_sql_query(query, conn)
+        
+        conn.close()
     
     if df.empty:
         return pd.DataFrame(
@@ -621,36 +927,67 @@ def load_transport_data(selected_month_slug: str | None = None):
     })
     
     # Convert return_included from int to boolean
-    df["Return Included"] = df["Return Included"].astype(bool)
+    if "Return Included" in df.columns:
+        df["Return Included"] = df["Return Included"].astype(bool)
     
     return df
 
 
 def save_transport_data(df: pd.DataFrame):
     """Save transport data to database (current month)."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Delete existing current month data
-    cursor.execute("DELETE FROM transport WHERE month_slug IS NULL")
-    
-    # Insert new data
-    for _, row in df.iterrows():
-        cursor.execute("""
-            INSERT INTO transport (date, from_location, destination, return_included, project_code, project_name, month_slug)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(row.get("Date", "")),
-            str(row.get("From", "")),
-            str(row.get("Destination", "")),
-            1 if row.get("Return Included", False) else 0,
-            str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
-            str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
-            None  # Current month
-        ))
-    
-    conn.commit()
-    conn.close()
+    if USE_SUPABASE:
+        supabase = get_supabase_client()
+        if not supabase:
+            return
+        
+        try:
+            # Delete existing current month data
+            supabase.table("transport").delete().is_("month_slug", "null").execute()
+            
+            # Prepare records for insertion
+            records = []
+            for _, row in df.iterrows():
+                records.append({
+                    "date": str(row.get("Date", "")),
+                    "from_location": str(row.get("From", "")),
+                    "destination": str(row.get("Destination", "")),
+                    "return_included": 1 if row.get("Return Included", False) else 0,
+                    "project_code": str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                    "project_name": str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                    "month_slug": None
+                })
+            
+            # Insert new data
+            if records:
+                supabase.table("transport").insert(records).execute()
+        except Exception as e:
+            st.error(f"Error saving to Supabase: {e}")
+    else:
+        conn = get_db_connection()
+        if conn is None:
+            return
+        cursor = conn.cursor()
+        
+        # Delete existing current month data
+        cursor.execute("DELETE FROM transport WHERE month_slug IS NULL")
+        
+        # Insert new data
+        for _, row in df.iterrows():
+            cursor.execute("""
+                INSERT INTO transport (date, from_location, destination, return_included, project_code, project_name, month_slug)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(row.get("Date", "")),
+                str(row.get("From", "")),
+                str(row.get("Destination", "")),
+                1 if row.get("Return Included", False) else 0,
+                str(row.get("Project Code", "")) if pd.notna(row.get("Project Code")) else "",
+                str(row.get("Project Name", "")) if pd.notna(row.get("Project Name")) else "",
+                None  # Current month
+            ))
+        
+        conn.commit()
+        conn.close()
     
     # Also save to CSV for backup compatibility
     try:
@@ -931,10 +1268,27 @@ def generate_receipts_package(report_month: str, selected_month_slug: str | None
     # copy images
     if "Original_Image_Path" in df.columns:
         for _, row in df.iterrows():
-            src = os.path.join(images_dir, str(row["Original_Image_Path"]))
-            if os.path.exists(src):
-                dst = os.path.join(bills_folder, f"{row['Ref']}.jpg")
-                shutil.copy(src, dst)
+            image_path = str(row["Original_Image_Path"])
+            dst = os.path.join(bills_folder, f"{row['Ref']}.jpg")
+            
+            if USE_SUPABASE:
+                supabase = get_supabase_client()
+                if supabase:
+                    try:
+                        # Download from Supabase Storage
+                        file_data = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).download(image_path)
+                        with open(dst, "wb") as f:
+                            f.write(file_data)
+                    except Exception:
+                        # Fallback to local if Supabase download fails
+                        src = os.path.join(images_dir, image_path)
+                        if os.path.exists(src):
+                            shutil.copy(src, dst)
+            else:
+                # Local storage
+                src = os.path.join(images_dir, image_path)
+                if os.path.exists(src):
+                    shutil.copy(src, dst)
 
     # excel export
     excel_path = os.path.join(output_folder, f"Receipts_Expenses_{month_slug}.xlsx")
@@ -1369,9 +1723,30 @@ with tab1:
                             st.warning("Amount capped at 40")
 
                         temp_filename = f"temp_{datetime.now().timestamp()}.jpg"
-                        save_path = os.path.join(IMAGES_DIR, temp_filename)
-                        with open(save_path, "wb") as f:
-                            f.write(uploaded_file.getbuffer())
+                        
+                        # Save image to Supabase Storage or local filesystem
+                        if USE_SUPABASE:
+                            supabase = get_supabase_client()
+                            if supabase:
+                                try:
+                                    # Upload to Supabase Storage
+                                    file_data = uploaded_file.getbuffer()
+                                    supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+                                        temp_filename,
+                                        file_data,
+                                        file_options={"content-type": "image/jpeg"}
+                                    )
+                                except Exception as e:
+                                    st.error(f"Error uploading image to Supabase: {e}")
+                                    # Fallback to local storage
+                                    save_path = os.path.join(IMAGES_DIR, temp_filename)
+                                    with open(save_path, "wb") as f:
+                                        f.write(uploaded_file.getbuffer())
+                        else:
+                            # Local storage (SQLite mode)
+                            save_path = os.path.join(IMAGES_DIR, temp_filename)
+                            with open(save_path, "wb") as f:
+                                f.write(uploaded_file.getbuffer())
 
                         df = load_data_for(None)
                         new_row = {
