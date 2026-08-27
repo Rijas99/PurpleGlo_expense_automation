@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Transport · PurpleGlo{% endblock %}
+{% block content %}
+<section class="head-row">
+  <h1>Transport</h1>
+  <a class="btn" href="/export/transport">Download Excel</a>
+</section>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th><th>From</th><th>Destination</th>
+        <th>Return</th><th>Project code</th><th>Project name</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.date }}</td>
+        <td>{{ r.from_location }}</td>
+        <td>{{ r.destination }}</td>
+        <td>{% if r.return_included %}Yes{% else %}No{% endif %}</td>
+        <td>{{ r.project_code }}</td>
+        <td>{{ r.project_name }}</td>
+        <td>
+          {% if month_view == 'CURRENT' %}
+          <div class="row-actions">
+            <a class="edit" href="/transport/{{ r.id }}/edit">Edit</a>
+            <form method="post" action="/transport/{{ r.id }}/delete">
+              <button class="icon" type="submit">Delete</button>
+            </form>
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty">No transport records yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if month_view == 'CURRENT' %}
+{% set a = analysis or {} %}
+<form class="card" method="post" action="{% if editing %}/transport/{{ editing.id }}/update{% else %}/transport/save{% endif %}">
+  <h2>{% if editing %}Update trip{% else %}Add trip{% endif %}</h2>
+  <label>Date <input type="date" name="date" value="{{ a.get('date') or today }}" required /></label>
+  <label>From <input name="from_location" required placeholder="Dubai, UAE" value="{{ a.get('from_location') or '' }}" /></label>
+  <label>Destination <input name="destination" required placeholder="Abu Dhabi, UAE" value="{{ a.get('destination') or '' }}" /></label>
+  <label>Project code <input name="project_code" list="codes" value="{{ a.get('project_code') or '' }}" /></label>
+  <label>Project name * <input name="project_name" list="names" required value="{{ a.get('project_name') or '' }}" /></label>
+  <label class="check"><input type="checkbox" name="return_included" value="1" {% if a.get('return_included') %}checked{% endif %} /> Return included</label>
+  <button type="submit">{% if editing %}Update trip{% else %}Save{% endif %}</button>
+  {% if editing %}<a class="meta" href="/transport">Cancel</a>{% endif %}
+</form>
+<datalist id="codes">{% for code in project_codes %}<option value="{{ code }}">{% endfor %}</datalist>
+<datalist id="names">{% for n in project_names %}<option value="{{ n }}">{% endfor %}</datalist>
+{% endif %}
+{% endblock %}

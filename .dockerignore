@@ -1,0 +1,9 @@
+data/
+.env
+__pycache__/
+.pytest_cache/
+.git
+expense_workspace/
+docs/
+*.md
+expense_app.py

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in · PurpleGlo</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="login-body">
+  <form class="card login-card" method="post" action="/login">
+    <div class="brand">
+      <span class="mark">PG</span>
+      <div><strong>PurpleGlo</strong><span>Expense Manager</span></div>
+    </div>
+    {% if flash %}<div class="flash {{ flash.kind }}">{{ flash.text }}</div>{% endif %}
+    <label>Password
+      <input type="password" name="password" autofocus required />
+    </label>
+    <button type="submit">Enter</button>
+  </form>
+</body>
+</html>

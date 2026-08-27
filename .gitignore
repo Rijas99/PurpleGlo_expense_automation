@@ -1,13 +1,17 @@
-﻿# Secrets and API keys - CRITICAL
+﻿# Secrets and API keys
 secrets.toml
 .streamlit/
-*.toml
+.env
 
-# Data and workspace - ALL YOUR EXPENSE DATA
+# Data and workspace
 expense_workspace/
+data/
 *.csv
-*.xlsx
 *.zip
+
+# Keep the company expense template
+*.xlsx
+!excel format/Expense Form.xlsx
 
 # Generated files
 files/
@@ -21,7 +25,9 @@ __pycache__/
 *.pyc
 *.pyo
 .Python
+.pytest_cache/
 
 # OS
 .DS_Store
 Thumbs.db
+~$*.xlsx

@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Credit card · PurpleGlo{% endblock %}
+{% block content %}
+<section class="head-row">
+  <h1>Credit card</h1>
+  <a class="btn" href="/export/credit-card">Download zip + bills</a>
+</section>
+<div class="metric">Total {{ "%.2f"|format(total) }} SAR/AED</div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Bill</th><th>Ref</th><th>Date</th><th>Description</th><th>Category</th>
+        <th>Project code</th><th>Project name</th><th>Amount</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>
+          {% if r.image_bytes %}
+          <a href="/credit-card/{{ r.id }}/image" target="_blank" rel="noopener">
+            <img class="thumb" src="/credit-card/{{ r.id }}/image" alt="Bill {{ r.ref or r.id }}" />
+          </a>
+          {% else %}
+          <span class="empty">—</span>
+          {% endif %}
+        </td>
+        <td>{{ r.ref or "—" }}</td>
+        <td>{{ r.date }}</td>
+        <td>{{ r.description }}</td>
+        <td>{{ r.category }}</td>
+        <td>{{ r.project_code }}</td>
+        <td>{{ r.project_name }}</td>
+        <td class="num">{{ "%.2f"|format(r.amount) }}</td>
+        <td>
+          {% if month_view == 'CURRENT' %}
+          <div class="row-actions">
+            <a class="edit" href="/credit-card/{{ r.id }}/edit">Edit</a>
+            <form method="post" action="/credit-card/{{ r.id }}/delete">
+              <button class="icon" type="submit">Delete</button>
+            </form>
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="empty">No credit card expenses yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% if month_view == 'CURRENT' %}
+<div class="grid">
+  {% if not editing %}
+  <form class="card" method="post" action="/credit-card/analyze" enctype="multipart/form-data">
+    <h2>Read receipt</h2>
+    <p class="hint">Same as receipts: Gemini fills the form from the photo. You can still type if needed.</p>
+    <input type="file" name="photo" accept="image/*" capture="environment" required />
+    <button type="submit">Read receipt</button>
+  </form>
+  {% endif %}
+  <form class="card" method="post" action="{% if editing %}/credit-card/{{ editing.id }}/update{% else %}/credit-card/save{% endif %}" enctype="multipart/form-data">
+    <h2>{% if editing %}Update expense{% else %}Check and save{% endif %}</h2>
+    {% set a = analysis or {} %}
+    <label>{% if editing %}Replace photo{% else %}Receipt photo{% endif %}
+      <input type="file" name="photo" accept="image/*" capture="environment" />
+    </label>
+    <label>Date <input type="date" name="date" value="{{ a.get('date') or today }}" required /></label>
+    <label>Category
+      <select name="category">
+        {% for c in categories %}
+        <option value="{{ c }}" {% if a.get('category') == c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Description <input name="description" value="{{ a.get('description') or '' }}" required /></label>
+    <label>Amount <input type="number" step="0.01" min="0" name="amount" value="{{ a.get('amount') or '' }}" required /></label>
+    <label>Project code <input name="project_code" list="codes" value="{{ a.get('project_code') or '' }}" /></label>
+    <label>Project name * <input name="project_name" list="names" required value="{{ a.get('project_name') or '' }}" /></label>
+    <label class="check"><input type="checkbox" name="cap_food" value="1" /> Cap food to {{ food_cap|int if food_cap is defined else 40 }}</label>
+    <button type="submit">{% if editing %}Update{% else %}Save{% endif %}</button>
+    {% if editing %}<a class="meta" href="/credit-card">Cancel</a>{% endif %}
+  </form>
+</div>
+<datalist id="codes">{% for code in project_codes %}<option value="{{ code }}">{% endfor %}</datalist>
+<datalist id="names">{% for n in project_names %}<option value="{{ n }}">{% endfor %}</datalist>
+{% endif %}
+{% endblock %}

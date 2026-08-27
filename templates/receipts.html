@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}Receipts · PurpleGlo{% endblock %}
+{% block content %}
+<section class="head-row">
+  <h1>Receipts</h1>
+  <a class="btn" href="/export/receipts">Download expense form + bills</a>
+</section>
+
+<div class="metric">Total {{ "%.2f"|format(total) }} SAR/AED</div>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Bill</th><th>Ref</th><th>Date</th><th>Description</th><th>Category</th>
+        <th>Project code</th><th>Project name</th><th>Amount</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>
+          {% if r.image_bytes %}
+          <a href="/receipts/{{ r.ref }}/image" target="_blank" rel="noopener">
+            <img class="thumb" src="/receipts/{{ r.ref }}/image" alt="Receipt {{ r.ref }}" />
+          </a>
+          {% else %}
+          <span class="empty">—</span>
+          {% endif %}
+        </td>
+        <td>{{ r.ref }}</td>
+        <td>{{ r.date }}</td>
+        <td>{{ r.description }}</td>
+        <td>{{ r.category }}</td>
+        <td>{{ r.project_code }}</td>
+        <td>{{ r.project_name }}</td>
+        <td class="num">{{ "%.2f"|format(r.amount) }}</td>
+        <td>
+          {% if month_view == 'CURRENT' %}
+          <div class="row-actions">
+            <a class="edit" href="/receipts/{{ r.ref }}/edit">Edit</a>
+            <form method="post" action="/receipts/{{ r.ref }}/delete" onsubmit="return confirm('Delete receipt {{ r.ref }}?')">
+              <button class="icon" type="submit">Delete</button>
+            </form>
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="empty">No receipts yet. Upload a photo or send one to Telegram.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if month_view == 'CURRENT' %}
+<div class="grid">
+  {% if not editing %}
+  <form class="card" method="post" action="/receipts/analyze" enctype="multipart/form-data">
+    <h2>Upload receipt</h2>
+    <p class="hint">Camera or file. Gemini fills the form; you can still edit before save.</p>
+    <input type="file" name="photo" accept="image/*" capture="environment" required />
+    <button type="submit">Read receipt</button>
+  </form>
+  {% endif %}
+
+  <form class="card" method="post" action="{% if editing %}/receipts/{{ editing.ref }}/update{% else %}/receipts/save{% endif %}" {% if editing %}enctype="multipart/form-data"{% endif %}>
+    <h2>{% if editing %}Update receipt {{ editing.ref }}{% else %}Check and save{% endif %}</h2>
+    {% set a = analysis or {} %}
+    {% if editing %}
+    <label>Replace photo
+      <input type="file" name="photo" accept="image/*" capture="environment" />
+    </label>
+    {% endif %}
+    <label>Date
+      <input type="date" name="date" value="{{ a.get('date') or today }}" required />
+    </label>
+    <label>Category
+      <select name="category">
+        {% for c in categories %}
+        <option value="{{ c }}" {% if a.get('category') == c %}selected{% endif %}>{{ c }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Description
+      <input name="description" value="{{ a.get('description') or '' }}" required />
+    </label>
+    <label>Amount
+      <input type="number" step="0.01" min="0" name="amount" value="{{ a.get('amount') or 0 }}" required />
+    </label>
+    <label>Project code
+      <input name="project_code" list="codes" value="{{ a.get('project_code') or '' }}" placeholder="e.g. 250909-PDS-303" />
+    </label>
+    <label>Project name *
+      <input name="project_name" list="names" required placeholder="e.g. Site Alpha" value="{{ a.get('project_name') or '' }}" />
+    </label>
+    <label class="check"><input type="checkbox" name="cap_food" value="1" /> Cap food to {{ food_cap|int }}</label>
+    <button type="submit">{% if editing %}Update receipt{% else %}Save receipt{% endif %}</button>
+    {% if editing %}<a class="meta" href="/">Cancel</a>{% endif %}
+  </form>
+</div>
+<datalist id="codes">
+  {% for code in project_codes %}
+  <option value="{{ code }}"></option>
+  {% endfor %}
+</datalist>
+<datalist id="names">
+  {% for n in project_names %}
+  <option value="{{ n }}"></option>
+  {% endfor %}
+</datalist>
+{% endif %}
+{% endblock %}

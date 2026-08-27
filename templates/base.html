@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}PurpleGlo Expenses{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="mark">PG</span>
+      <div>
+        <strong>PurpleGlo</strong>
+        <span>Expense Manager</span>
+      </div>
+    </div>
+    <nav>
+      <a href="/" class="{% if active == 'receipts' %}on{% endif %}">Receipts</a>
+      <a href="/credit-card" class="{% if active == 'cc' %}on{% endif %}">Credit card</a>
+      <a href="/transport" class="{% if active == 'transport' %}on{% endif %}">Transport</a>
+    </nav>
+  </header>
+
+  <aside class="rail">
+    <form method="post" action="/settings" class="rail-form">
+      <p class="rail-kicker">Report month</p>
+      <div class="month-pick">
+        <label>Month
+          <select name="report_month_month" onchange="this.form.submit()">
+            {% for abbr, name in months %}
+            <option value="{{ abbr }}" {% if abbr == report_month_month %}selected{% endif %}>{{ name }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>Year
+          <select name="report_month_year" onchange="this.form.submit()">
+            {% for y in years %}
+            <option value="{{ y }}" {% if y == report_month_year %}selected{% endif %}>{{ y }}</option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <p class="hint">Keep this on the month you will submit. Example: leave August selected until you submit in the first week of September.</p>
+      {% if archived %}
+      <label>Look at
+        <select name="month_view" onchange="this.form.submit()">
+          <option value="CURRENT" {% if month_view == 'CURRENT' %}selected{% endif %}>Working month ({{ report_month }})</option>
+          {% for m in archived %}
+          <option value="{{ m }}" {% if month_view == m %}selected{% endif %}>{{ m.replace('_', ' ') }} — archived</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% else %}
+      <input type="hidden" name="month_view" value="CURRENT" />
+      {% endif %}
+    </form>
+
+    <div class="rail-actions">
+      <a class="btn" href="/export/all">Download {{ looking_at_label }}</a>
+      <p class="hint">Receipts, credit card, and transport for the month you are looking at.</p>
+      <form method="post" action="/archive" onsubmit="return confirm('Archive current month and start a new one?')">
+        <button class="ghost" type="submit">Start new month</button>
+      </form>
+    </div>
+
+    <div class="rail-status">
+      <div class="pills">
+        <span class="pill {% if gemini_ready %}ok{% else %}bad{% endif %}">Gemini {% if gemini_ready %}ready{% else %}missing key{% endif %}</span>
+        <span class="pill {% if telegram_ready %}ok{% else %}bad{% endif %}">Telegram {% if telegram_ready %}ready{% else %}off{% endif %}</span>
+      </div>
+      <p class="meta">{{ employee_name }}</p>
+      <a class="meta" href="/backup">Download SQLite backup</a>
+    </div>
+  </aside>
+
+  <main>
+    {% if flash %}
+    <div class="flash {{ flash.kind }}">{{ flash.text }}</div>
+    {% endif %}
+    {% if month_view != 'CURRENT' %}
+    <div class="flash warn">Viewing archived month {{ month_view.replace('_', ' ') }} (read-only add).</div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>
