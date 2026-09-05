@@ -1,7 +1,8 @@
 from fastapi.testclient import TestClient
 
+from app import config
 from app.db import add_credit_card, add_receipt, add_transport
-from app.main import app, next_report_month
+from app.main import app, next_report_month, public_base_url
 
 
 def test_health():
@@ -9,6 +10,32 @@ def test_health():
         response = client.get("/health")
         assert response.status_code == 200
         assert response.json()["ok"] is True
+
+
+def test_public_base_url_uses_webhook_setting(monkeypatch):
+    monkeypatch.delenv("KEEP_AWAKE_URL", raising=False)
+    monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
+    monkeypatch.setattr(config.settings, "telegram_webhook_url", "https://purpleglo-expense.onrender.com/")
+    assert public_base_url() == "https://purpleglo-expense.onrender.com"
+
+
+def test_telegram_webhook_returns_ok_in_background(monkeypatch):
+    monkeypatch.setattr(config.settings, "telegram_webhook_secret", "test-secret")
+    seen = {}
+
+    async def fake_handle(db_path, update):
+        seen["update"] = update
+
+    monkeypatch.setattr("app.main.handle_update", fake_handle)
+    with TestClient(app) as client:
+        response = client.post(
+            "/telegram/webhook",
+            json={"update_id": 7, "message": {"text": "hi"}},
+            headers={"X-Telegram-Bot-Api-Secret-Token": "test-secret"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert seen["update"]["update_id"] == 7
 
 
 def test_home_renders_receipts_page():

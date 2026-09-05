@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+import httpx
+from fastapi import BackgroundTasks, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -271,24 +273,54 @@ async def _poll_telegram():
             await asyncio.sleep(3)
 
 
+def public_base_url() -> str:
+    return (
+        os.environ.get("KEEP_AWAKE_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or settings.telegram_webhook_url
+        or ""
+    ).strip().rstrip("/")
+
+
+async def _keep_awake():
+    """Hit the public URL so Render's free instance does not spin down."""
+    base = public_base_url()
+    if not base:
+        return
+    await asyncio.sleep(30)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                await client.get(f"{base}/health")
+            log.info("keep-awake ping ok")
+        except Exception:
+            log.warning("keep-awake ping failed", exc_info=True)
+        await asyncio.sleep(10 * 60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db(db())
     STATIC.mkdir(exist_ok=True)
     EXPORTS.mkdir(parents=True, exist_ok=True)
     PENDING.mkdir(parents=True, exist_ok=True)
-    poll_task = None
+    background = []
     if settings.telegram_bot_token and settings.telegram_webhook_url:
-        try:
-            register_webhook()
-            log.info("Telegram webhook registered")
-        except Exception:
-            log.exception("Could not register Telegram webhook")
+        async def _register_webhook_safe():
+            try:
+                await asyncio.to_thread(register_webhook)
+                log.info("Telegram webhook registered")
+            except Exception:
+                log.exception("Could not register Telegram webhook")
+
+        background.append(asyncio.create_task(_register_webhook_safe()))
     elif settings.telegram_bot_token:
-        poll_task = asyncio.create_task(_poll_telegram())
+        background.append(asyncio.create_task(_poll_telegram()))
+    if public_base_url() and not os.environ.get("PYTEST_CURRENT_TEST"):
+        background.append(asyncio.create_task(_keep_awake()))
     yield
-    if poll_task:
-        poll_task.cancel()
+    for task in background:
+        task.cancel()
 
 
 app = FastAPI(title="PurpleGlo Expense Manager", lifespan=lifespan)
@@ -921,12 +953,12 @@ def backup(request: Request):
 
 
 @app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if settings.telegram_webhook_secret and secret != settings.telegram_webhook_secret:
         return Response(status_code=403)
     update = await request.json()
-    await handle_update(db(), update)
+    background_tasks.add_task(handle_update, db(), update)
     return {"ok": True}
 
 
