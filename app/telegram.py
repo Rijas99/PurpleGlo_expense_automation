@@ -158,11 +158,73 @@ def parse_save_command(text: str) -> bool:
     return text.strip().lower() in {"save", "ok", "okay", "yes", "confirm", "✅"}
 
 
+_HELP_WORDS = {
+    "start",
+    "help",
+    "commands",
+    "menu",
+    "hi",
+    "hii",
+    "hiii",
+    "hy",
+    "hye",
+    "hey",
+    "heyy",
+    "hello",
+    "helloo",
+    "helo",
+    "hlo",
+    "hlw",
+    "hai",
+    "yo",
+    "hola",
+    "howdy",
+    "morning",
+    "evening",
+    "sup",
+    "wassup",
+    "salam",
+    "salaam",
+}
+_HELP_PHRASES = {
+    "hi there",
+    "hey there",
+    "hello there",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "good night",
+    "whats up",
+    "what's up",
+}
+
+
 def is_start_command(text: str) -> bool:
     if not text:
         return False
     lowered = text.strip().lower()
-    return lowered in {"/start", "start", "help", "/help"} or lowered.startswith("/start")
+    if lowered.startswith(("/start", "/help", "/commands", "/menu")):
+        return True
+    cleaned = re.sub(r"[!.?]+$", "", lowered).strip()
+    return cleaned in _HELP_WORDS or cleaned in _HELP_PHRASES
+
+
+def commands_help_text() -> str:
+    return (
+        "How to add expenses:\n\n"
+        "Receipts — send a photo. Caption = project name, optional extra lines:\n"
+        "adnoc\n"
+        "dis: ali and rijas\n"
+        "cap,40\n\n"
+        "Food bills become Breakfast / Lunch / Dinner from the time on the receipt.\n"
+        "Breakfast 5:00–11:15, Lunch 11:15–18:15, Dinner after that.\n\n"
+        "Credit card — send a photo, caption:\n"
+        "CC, adnoc\n\n"
+        "Transport — text only, no photo:\n"
+        "TR, Dubai, Abu Dhabi, adnoc\n"
+        "TR, Dubai, Abu Dhabi, adnoc, return\n\n"
+        "Then tap Save or send save."
+    )
 
 
 def dumps_draft(draft: dict) -> str:

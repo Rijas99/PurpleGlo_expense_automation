@@ -19,6 +19,7 @@ from app.db import (
 )
 from app.gemini import analyze_receipt_bytes
 from app.telegram import (
+    commands_help_text,
     dumps_draft,
     format_draft_message,
     is_start_command,
@@ -301,27 +302,12 @@ async def handle_update(db_path, update: dict) -> None:
 
 async def _handle_text(db_path, chat_id: str, text: str) -> None:
     if is_start_command(text):
-        send_message(
-            chat_id,
-            "How to add expenses:\n\n"
-            "Receipts — send a photo. Caption = project name, optional extra lines:\n"
-            "adnoc\n"
-            "dis: ali and rijas\n"
-            "cap,40\n\n"
-            "Food bills become Breakfast / Lunch / Dinner from the time on the receipt.\n"
-            "Breakfast 5:00–11:15, Lunch 11:15–18:15, Dinner after that.\n\n"
-            "Credit card — send a photo, caption:\n"
-            "CC, adnoc\n\n"
-            "Transport — text only, no photo:\n"
-            "TR, Dubai, Abu Dhabi, adnoc\n"
-            "TR, Dubai, Abu Dhabi, adnoc, return\n\n"
-            "Then tap Save or send save.",
-        )
+        send_message(chat_id, commands_help_text())
         return
 
     row = get_draft(db_path, chat_id)
     if not row:
-        send_message(chat_id, "No draft yet. Send a receipt photo first.")
+        send_message(chat_id, commands_help_text())
         return
 
     draft = loads_draft(row["payload"])

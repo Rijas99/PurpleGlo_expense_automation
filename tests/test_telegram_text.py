@@ -37,6 +37,13 @@ def test_start_command_matches_bot_suffix():
     assert is_start_command("amount 10") is False
 
 
+def test_greetings_ask_for_commands():
+    for text in ("hi", "Hi", "hy", "hey", "hello", "hello!", "good morning", "help"):
+        assert is_start_command(text) is True
+    assert is_start_command("adnoc") is False
+    assert is_start_command("TR, Dubai, Abu Dhabi, adnoc") is False
+
+
 def test_caption_plain_text_is_project_name():
     note = parse_telegram_note("adnoc")
     assert note["kind"] == "receipt"
