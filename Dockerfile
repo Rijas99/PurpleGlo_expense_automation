@@ -11,4 +11,4 @@ COPY "excel format" "./excel format"
 
 ENV PORT=8000 PYTHONUNBUFFERED=1
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "mkdir -p /app/data && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

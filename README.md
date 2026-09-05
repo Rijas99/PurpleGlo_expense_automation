@@ -45,13 +45,16 @@ cap
 
 **Download expense form + bills** copies `excel format/Expense Form.xlsx`, writes NAME, MONTH, and rows (REF, DATE, DESCRIPTION, CATEGORY, PROJECT CODE, AMOUNT), keeps the TOTAL formula and logo, and zips receipt images as `1.jpg`, `2.jpg`, …
 
-## Free cloud (Render / Fly / similar)
+## Free cloud (Render)
 
-1. Build with the `Dockerfile`.
-2. Set env vars: `GOOGLE_API_KEY`, `TELEGRAM_BOT_TOKEN`, `APP_PASSWORD`, `SECRET_KEY`, `TELEGRAM_WEBHOOK_URL=https://YOUR-HOST`, `TELEGRAM_WEBHOOK_SECRET`.
-3. After deploy, the app registers a webhook at `/telegram/webhook`.
-4. First visit after idle is faster than Streamlit, but a sleeping free host can still pause. Hit `/health` from an uptime ping if you want it awake.
-5. Free disks are often wiped on redeploy — use **Download SQLite backup** and the Excel zip.
+This app can run on Render’s [free web service](https://render.com/docs/your-first-deploy). Free instances sleep after 15 minutes of no traffic, and the disk is wiped on restart — download a SQLite backup often.
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Rijas99/PurpleGlo_expense_automation)
+
+1. Sign up at Render with GitHub (free, no card).
+2. Click the button above, or **New → Web Service** and select this repo (Docker, free plan).
+3. When prompted, paste `GOOGLE_API_KEY`, `TELEGRAM_BOT_TOKEN`, `APP_PASSWORD`, and set `TELEGRAM_WEBHOOK_URL` to `https://YOUR-SERVICE.onrender.com`.
+4. After deploy, stop any local `uvicorn` so Telegram is not polled twice.
 
 ## Tests
 
