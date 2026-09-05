@@ -9,3 +9,4 @@ google-generativeai
 openpyxl
 python-dotenv
 pytest
+libsql

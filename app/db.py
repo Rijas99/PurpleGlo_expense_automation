@@ -4,6 +4,97 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from app.config import settings
+
+
+class _Row:
+    """sqlite3.Row-like mapping for libsql tuple rows."""
+
+    def __init__(self, pairs: list[tuple[str, Any]]):
+        self._data = dict(pairs)
+        self._keys = [k for k, _ in pairs]
+        self._vals = [v for _, v in pairs]
+
+    def keys(self):
+        return self._keys
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return self._data[key]
+
+
+class _CompatCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        if row is None:
+            return None
+        names = [d[0] for d in (self._cursor.description or [])]
+        if not names:
+            return row
+        return _Row(list(zip(names, row)))
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        names = [d[0] for d in (self._cursor.description or [])]
+        if not names:
+            return list(rows)
+        return [_Row(list(zip(names, row))) for row in rows]
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def description(self):
+        return self._cursor.description
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _CompatConn:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=None):
+        if params is None:
+            return _CompatCursor(self._conn.execute(sql))
+        return _CompatCursor(self._conn.execute(sql, params))
+
+    def executescript(self, sql):
+        return self._conn.executescript(sql)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def turso_enabled() -> bool:
+    return bool(settings.turso_database_url and settings.turso_auth_token)
+
+
+def _connect(db_path: Path | str):
+    if turso_enabled():
+        import libsql
+
+        conn = libsql.connect(settings.turso_database_url, auth_token=settings.turso_auth_token)
+        return _CompatConn(conn)
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS receipts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,14 +148,6 @@ CREATE INDEX IF NOT EXISTS idx_transport_month ON transport(month_slug);
 """
 
 
-def _connect(db_path: Path | str) -> sqlite3.Connection:
-    path = Path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_db(db_path: Path | str) -> None:
     conn = _connect(db_path)
     try:
@@ -75,7 +158,7 @@ def init_db(db_path: Path | str) -> None:
         conn.close()
 
 
-def _migrate_credit_card(conn: sqlite3.Connection) -> None:
+def _migrate_credit_card(conn) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(credit_card)").fetchall()}
     if "image_bytes" not in cols:
         conn.execute("ALTER TABLE credit_card ADD COLUMN image_bytes BLOB")
@@ -183,7 +266,7 @@ def delete_receipt(db_path: Path | str, ref: int) -> bool:
         conn.close()
 
 
-def _renumber_current_receipts(conn: sqlite3.Connection) -> None:
+def _renumber_current_receipts(conn) -> None:
     rows = conn.execute(
         "SELECT id FROM receipts WHERE month_slug IS NULL ORDER BY ref, id"
     ).fetchall()
@@ -620,4 +703,28 @@ def delete_draft(db_path: Path | str, chat_id: str) -> None:
         conn.execute("DELETE FROM drafts WHERE chat_id = ?", (str(chat_id),))
         conn.commit()
     finally:
+        conn.close()
+
+
+def import_sqlite_file(src_path: Path | str, dest_path: Path | str | None = None) -> None:
+    """Copy all expense tables from a local SQLite file into the active database (Turso or local)."""
+    src = sqlite3.connect(src_path)
+    src.row_factory = sqlite3.Row
+    conn = _connect(dest_path or src_path)
+    try:
+        conn.executescript(_SCHEMA)
+        for table in ("receipts", "credit_card", "transport", "drafts"):
+            conn.execute(f"DELETE FROM {table}")
+            rows = src.execute(f"SELECT * FROM {table}").fetchall()
+            if not rows:
+                continue
+            cols = list(rows[0].keys())
+            placeholders = ",".join("?" * len(cols))
+            col_list = ",".join(cols)
+            sql = f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})"
+            for row in rows:
+                conn.execute(sql, [row[c] for c in cols])
+        conn.commit()
+    finally:
+        src.close()
         conn.close()

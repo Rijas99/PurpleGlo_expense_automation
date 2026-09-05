@@ -204,3 +204,42 @@ def test_project_names_include_archived(tmp_path):
     names = project_names(db_path)
     assert "adnoc" in names
     assert "site alpha" in names
+
+
+def test_libsql_compat_rows_and_import(tmp_path):
+    import libsql
+
+    from app.db import _CompatConn, import_sqlite_file, list_receipts
+
+    src = tmp_path / "src.db"
+    init_db(src)
+    add_receipt(
+        src,
+        {
+            "ref": 1,
+            "date": "15-Aug",
+            "description": "Lunch",
+            "category": "Food & Beverages",
+            "project_code": "P1",
+            "project_name": "mees",
+            "amount": 16.0,
+            "image_bytes": b"jpeg-bytes",
+            "image_mime": "image/jpeg",
+        },
+    )
+    dest = tmp_path / "dest.db"
+    import_sqlite_file(src, dest)
+    rows = list_receipts(dest, month_slug=None)
+    assert len(rows) == 1
+    assert rows[0]["description"] == "Lunch"
+    assert rows[0]["image_bytes"] == b"jpeg-bytes"
+
+    raw = libsql.connect(":memory:")
+    conn = _CompatConn(raw)
+    conn.executescript("CREATE TABLE t (id INTEGER, name TEXT); INSERT INTO t VALUES (1, 'a');")
+    conn.commit()
+    row = conn.execute("SELECT id, name FROM t").fetchone()
+    assert row["id"] == 1
+    assert row[1] == "a"
+    assert dict(row)["name"] == "a"
+    conn.close()

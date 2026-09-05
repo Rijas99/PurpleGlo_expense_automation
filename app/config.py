@@ -26,6 +26,8 @@ class Settings:
     database_path: Path = Path(_env("DATABASE_PATH") or str(ROOT / "data" / "expenses.db"))
     template_path: Path = ROOT / "excel format" / "Expense Form.xlsx"
     gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
+    turso_database_url: str = _env("TURSO_DATABASE_URL")
+    turso_auth_token: str = _env("TURSO_AUTH_TOKEN")
 
     def allowed_telegram_ids(self) -> set[str]:
         if not self.telegram_allowed_user_ids:
