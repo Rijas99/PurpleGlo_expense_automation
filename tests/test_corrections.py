@@ -5,9 +5,15 @@ from app.constants import FOOD_CAP_AMOUNT
 
 
 def test_meal_breakfast_lunch_dinner():
+    assert get_meal_description(dt_time(5, 0)) == "Breakfast"
     assert get_meal_description(dt_time(8, 0)) == "Breakfast"
+    assert get_meal_description(dt_time(11, 0)) == "Breakfast"
+    assert get_meal_description(dt_time(11, 15)) == "Lunch"
     assert get_meal_description(dt_time(13, 0)) == "Lunch"
+    assert get_meal_description(dt_time(18, 0)) == "Lunch"
+    assert get_meal_description(dt_time(18, 15)) == "Dinner"
     assert get_meal_description(dt_time(20, 0)) == "Dinner"
+    assert get_meal_description(dt_time(3, 0)) == "Dinner"
 
 
 def test_correction_updates_amount():
@@ -41,6 +47,7 @@ def test_photo_caption_plain_text_sets_project_name():
     draft = build_receipt_draft(
         {
             "date": "2026-08-15",
+            "time": "13:00",
             "amount": 50,
             "description": "Lunch",
             "category": "Food & Beverages",
@@ -50,6 +57,25 @@ def test_photo_caption_plain_text_sets_project_name():
     assert draft["kind"] == "receipt"
     assert draft["project_name"] == "adnoc"
     assert draft["description"] == "Lunch"
+
+
+def test_photo_caption_dis_adds_note_to_food_description():
+    from app.bot import build_receipt_draft
+
+    draft = build_receipt_draft(
+        {
+            "date": "2026-08-15",
+            "time": "13:00",
+            "amount": 45,
+            "description": "Restaurant meal",
+            "category": "Food & Beverages",
+        },
+        caption="adnoc\ndis: ali and rijas\ncap,40",
+    )
+    assert draft["project_name"] == "adnoc"
+    assert draft["description"].startswith("Lunch, ali and rijas")
+    assert draft["amount"] == 40.0
+    assert "capped at 40" in draft["description"]
 
 
 def test_photo_caption_cc_sets_credit_card_kind():
@@ -81,10 +107,39 @@ def test_cap_command_reduces_food_amount_and_notes_description():
         "amount": 75.0,
         "description": "Lunch",
         "category": "Food & Beverages",
+        "time": "13:00",
     }
     updated = apply_corrections(draft, "cap")
     assert updated["amount"] == FOOD_CAP_AMOUNT
     assert "capped at 40" in updated["description"]
+
+
+def test_cap_comma_amount_uses_given_limit():
+    draft = {
+        "amount": 45.0,
+        "description": "Lunch",
+        "category": "Food & Beverages",
+        "time": "13:00",
+    }
+    updated = apply_corrections(draft, "cap,40")
+    assert updated["amount"] == 40.0
+    assert "capped at 40" in updated["description"]
+    updated = apply_corrections(draft, "cap, 30")
+    assert updated["amount"] == 30.0
+    assert "capped at 30" in updated["description"]
+
+
+def test_dis_appends_to_food_meal_name():
+    draft = {
+        "amount": 45.0,
+        "description": "Lunch",
+        "category": "Food & Beverages",
+        "time": "13:00",
+        "project_name": "adnoc",
+    }
+    updated = apply_corrections(draft, "dis: ali and rijas")
+    assert updated["description"] == "Lunch, ali and rijas"
+    assert updated["project_name"] == "adnoc"
 
 
 def test_corrections_do_not_mutate_original():

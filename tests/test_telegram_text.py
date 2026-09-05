@@ -43,6 +43,22 @@ def test_caption_plain_text_is_project_name():
     assert note["project_name"] == "adnoc"
 
 
+def test_caption_project_and_dis():
+    note = parse_telegram_note("adnoc\ndis: ali and rijas")
+    assert note["kind"] == "receipt"
+    assert note["project_name"] == "adnoc"
+    assert note["extra_description"] == "ali and rijas"
+    note = parse_telegram_note("adnoc dis: ali and rijas")
+    assert note["project_name"] == "adnoc"
+    assert note["extra_description"] == "ali and rijas"
+
+
+def test_caption_includes_cap_amount():
+    note = parse_telegram_note("adnoc\ncap,40")
+    assert note["project_name"] == "adnoc"
+    assert note["cap_amount"] == 40.0
+
+
 def test_caption_cc_prefix_is_credit_card():
     note = parse_telegram_note("CC, adnoc")
     assert note["kind"] == "credit_card"

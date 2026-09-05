@@ -15,10 +15,11 @@ _DATE_RE = re.compile(
     re.I,
 )
 _DESC_RE = re.compile(r"^\s*(?:description|desc)\s*[:=]?\s*(.+)\s*$", re.I)
+_DIS_LINE_RE = re.compile(r"^\s*dis\s*:\s*(.+)\s*$", re.I)
 _PROJECT_NAME_RE = re.compile(r"^\s*project\s*name\s*[:=]?\s*(.+)\s*$", re.I)
 _PROJECT_RE = re.compile(r"^\s*project(?:\s*code)?\s*[:=]?\s*(.+)\s*$", re.I)
 _CATEGORY_RE = re.compile(r"^\s*(?:category|cat)\s*[:=]?\s*(.+)\s*$", re.I)
-_CAP_RE = re.compile(r"^\s*cap(?:\s*(?:to\s*)?40)?\s*$", re.I)
+_CAP_RE = re.compile(r"^\s*cap(?:\s*(?:to)?\s*[,:]?\s*(\d+(?:\.\d+)?))?\s*$", re.I)
 
 
 def get_meal_description(time_obj) -> str:
@@ -33,12 +34,33 @@ def get_meal_description(time_obj) -> str:
     elif not isinstance(time_obj, dt_time):
         time_obj = datetime.now().time()
 
-    hour = time_obj.hour
-    if 5 <= hour < 12:
+    minutes = time_obj.hour * 60 + time_obj.minute
+    breakfast = 5 * 60
+    lunch = 11 * 60 + 15
+    dinner = 18 * 60 + 15
+    if breakfast <= minutes < lunch:
         return "Breakfast"
-    if 12 <= hour < 18:
+    if lunch <= minutes < dinner:
         return "Lunch"
     return "Dinner"
+
+
+def compose_description(draft: dict) -> str:
+    extra = str(draft.get("extra_description") or "").strip()
+    category = str(draft.get("category") or "")
+    if category == "Food & Beverages":
+        meal = get_meal_description(draft.get("time"))
+        text = f"{meal}, {extra}" if extra else meal
+    else:
+        base = str(draft.get("base_description") or draft.get("description") or "").strip()
+        if extra and base and extra.lower() not in base.lower():
+            text = f"{base}, {extra}"
+        else:
+            text = extra or base
+    cap_note = str(draft.get("cap_note") or "").strip()
+    if cap_note and cap_note not in text:
+        text = f"{text} {cap_note}".strip()
+    return text
 
 
 def _match_category(text: str) -> str | None:
@@ -75,7 +97,14 @@ def apply_corrections(draft: dict, text: str) -> dict:
 
         m = _DESC_RE.match(line)
         if m:
-            updated["description"] = m.group(1).strip()
+            updated["base_description"] = m.group(1).strip()
+            updated["description"] = compose_description(updated)
+            continue
+
+        m = _DIS_LINE_RE.match(line)
+        if m:
+            updated["extra_description"] = m.group(1).strip()
+            updated["description"] = compose_description(updated)
             continue
 
         m = _PROJECT_NAME_RE.match(line)
@@ -96,7 +125,9 @@ def apply_corrections(draft: dict, text: str) -> dict:
             continue
 
         if _CAP_RE.match(line):
-            _apply_food_cap(updated)
+            cap_m = _CAP_RE.match(line)
+            limit = float(cap_m.group(1)) if cap_m and cap_m.group(1) else FOOD_CAP_AMOUNT
+            _apply_cap(updated, limit)
             continue
 
         matched = _match_category(line)
@@ -109,17 +140,18 @@ def apply_corrections(draft: dict, text: str) -> dict:
     return updated
 
 
-def _apply_food_cap(draft: dict) -> None:
-    category = str(draft.get("category") or "")
+def _apply_cap(draft: dict, limit: float | None = None) -> None:
+    cap_to = FOOD_CAP_AMOUNT if limit is None else float(limit)
     try:
         amount = float(draft.get("amount") or 0)
     except (TypeError, ValueError):
         amount = 0.0
-    if category == "Food & Beverages" and amount > FOOD_CAP_AMOUNT:
-        desc = str(draft.get("description") or "").strip()
-        if "capped at 40" not in desc:
-            draft["description"] = f"{desc} (capped at 40)".strip()
-        draft["amount"] = FOOD_CAP_AMOUNT
+    if amount <= cap_to:
+        return
+    note = f"(capped at {cap_to:g})"
+    draft["amount"] = cap_to
+    draft["cap_note"] = note
+    draft["description"] = compose_description(draft)
 
 
 def _normalize_date(raw: str) -> str:

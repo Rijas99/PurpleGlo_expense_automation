@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 
 from app.config import settings
-from app.corrections import apply_corrections, format_display_date, get_meal_description
+from app.corrections import apply_corrections, compose_description, format_display_date, get_meal_description
 from app.db import (
     add_credit_card,
     add_receipt,
@@ -106,20 +106,23 @@ def user_allowed(user_id: int | None) -> bool:
 
 
 def _finalize_description(draft: dict) -> dict:
-    category = draft.get("category")
-    if category == "Food & Beverages" and not str(draft.get("description") or "").strip():
-        draft["description"] = get_meal_description(draft.get("time"))
+    if draft.get("category") == "Food & Beverages" and "base_description" not in draft:
+        draft["base_description"] = get_meal_description(draft.get("time"))
+    draft["description"] = compose_description(draft)
     return draft
 
 
 def build_receipt_draft(extracted: dict, caption: str = "") -> dict:
     note = parse_telegram_note(caption)
+    description = extracted.get("description") or ""
     draft = {
         "kind": note.get("kind") or "receipt",
         "date": extracted.get("date") or "",
         "time": extracted.get("time"),
         "amount": extracted.get("amount") or 0,
-        "description": extracted.get("description") or "",
+        "description": description,
+        "base_description": description,
+        "extra_description": note.get("extra_description") or "",
         "category": extracted.get("category") or "Can't classify",
         "project_code": "",
         "project_name": note.get("project_name") or "",
@@ -127,7 +130,11 @@ def build_receipt_draft(extracted: dict, caption: str = "") -> dict:
         "destination": note.get("destination") or "",
         "return_included": bool(note.get("return_included")),
     }
-    return _finalize_description(draft)
+    draft = _finalize_description(draft)
+    cap_amount = note.get("cap_amount")
+    if cap_amount is not None:
+        draft = apply_corrections(draft, f"cap,{cap_amount:g}")
+    return draft
 
 
 def build_transport_draft(note: dict) -> dict:
@@ -297,8 +304,12 @@ async def _handle_text(db_path, chat_id: str, text: str) -> None:
         send_message(
             chat_id,
             "How to add expenses:\n\n"
-            "Receipts — send a photo. Caption = project name only:\n"
-            "adnoc\n\n"
+            "Receipts — send a photo. Caption = project name, optional extra lines:\n"
+            "adnoc\n"
+            "dis: ali and rijas\n"
+            "cap,40\n\n"
+            "Food bills become Breakfast / Lunch / Dinner from the time on the receipt.\n"
+            "Breakfast 5:00–11:15, Lunch 11:15–18:15, Dinner after that.\n\n"
             "Credit card — send a photo, caption:\n"
             "CC, adnoc\n\n"
             "Transport — text only, no photo:\n"

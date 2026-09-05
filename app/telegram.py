@@ -6,6 +6,42 @@ import re
 from app.corrections import format_display_date
 
 
+_DIS_INLINE_RE = re.compile(r"\bdis\s*:\s*(.+)$", re.I)
+_CAP_INLINE_RE = re.compile(r"\bcap\s*[,:]\s*(\d+(?:\.\d+)?)\s*$", re.I)
+_CAP_LINE_RE = re.compile(r"^\s*cap(?:\s*(?:to)?\s*[,:]?\s*(\d+(?:\.\d+)?))?\s*$", re.I)
+_DIS_LINE_RE = re.compile(r"^\s*dis\s*:\s*(.+)\s*$", re.I)
+
+
+def _split_caption(text: str) -> tuple[str, str, float | None]:
+    extra_bits: list[str] = []
+    cap_amount: float | None = None
+    kept: list[str] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        cap_line = _CAP_LINE_RE.match(line)
+        if cap_line:
+            cap_amount = float(cap_line.group(1)) if cap_line.group(1) else 40.0
+            continue
+        dis_line = _DIS_LINE_RE.match(line)
+        if dis_line:
+            extra_bits.append(dis_line.group(1).strip())
+            continue
+        cap_inline = _CAP_INLINE_RE.search(line)
+        if cap_inline:
+            cap_amount = float(cap_inline.group(1))
+            line = line[: cap_inline.start()].strip(" ,")
+        dis_inline = _DIS_INLINE_RE.search(line)
+        if dis_inline:
+            extra_bits.append(dis_inline.group(1).strip())
+            line = line[: dis_inline.start()].strip(" ,")
+        if line:
+            kept.append(line)
+    extra = ", ".join(part for part in extra_bits if part)
+    return "\n".join(kept), extra, cap_amount
+
+
 def format_draft_message(draft: dict) -> str:
     date = draft.get("date") or "—"
     try:
@@ -59,6 +95,8 @@ def format_draft_message(draft: dict) -> str:
             "",
             "Caption shortcuts:",
             "photo + adnoc  →  receipt, project name adnoc",
+            "photo + adnoc / dis: ali and rijas  →  Lunch, ali and rijas",
+            "photo + cap,40  →  cap amount to 40",
             "photo + CC, adnoc  →  credit card",
             "TR, Dubai, Abu Dhabi, adnoc  →  transport",
             "",
@@ -74,34 +112,44 @@ def format_draft_message(draft: dict) -> str:
 def parse_telegram_note(text: str) -> dict:
     """Parse a photo caption or text command.
 
-    Receipts: the whole caption is the project name (e.g. adnoc).
+    Receipts: project name, optional dis: extra text, optional cap,40.
     Credit card: CC, project name
     Transport: TR, from, destination, project name [, return]
     """
     raw = (text or "").strip()
     if not raw:
-        return {"kind": "receipt", "project_name": ""}
+        return {"kind": "receipt", "project_name": "", "extra_description": "", "cap_amount": None}
 
-    cc = re.match(r"^\s*cc\s*[,:]\s*(.+)\s*$", raw, re.I)
-    if cc:
-        return {"kind": "credit_card", "project_name": cc.group(1).strip()}
+    remainder, extra, cap_amount = _split_caption(raw)
+    remainder = remainder.strip()
+    parsed: dict
+    if not remainder:
+        parsed = {"kind": "receipt", "project_name": ""}
+    else:
+        cc = re.match(r"^\s*cc\s*[,:]\s*(.+)\s*$", remainder, re.I)
+        if cc:
+            parsed = {"kind": "credit_card", "project_name": cc.group(1).strip()}
+        else:
+            tr = re.match(r"^\s*(?:tr|transport)\s*[,:]\s*(.+)\s*$", remainder, re.I)
+            if tr:
+                parts = [p.strip() for p in tr.group(1).split(",") if p.strip()]
+                return_included = False
+                if parts and parts[-1].lower() in {"return", "return included", "yes", "round trip"}:
+                    return_included = True
+                    parts = parts[:-1]
+                parsed = {
+                    "kind": "transport",
+                    "from_location": parts[0] if len(parts) > 0 else "",
+                    "destination": parts[1] if len(parts) > 1 else "",
+                    "project_name": ", ".join(parts[2:]) if len(parts) > 2 else "",
+                    "return_included": return_included,
+                }
+            else:
+                parsed = {"kind": "receipt", "project_name": remainder}
 
-    tr = re.match(r"^\s*(?:tr|transport)\s*[,:]\s*(.+)\s*$", raw, re.I)
-    if tr:
-        parts = [p.strip() for p in tr.group(1).split(",") if p.strip()]
-        return_included = False
-        if parts and parts[-1].lower() in {"return", "return included", "yes", "round trip"}:
-            return_included = True
-            parts = parts[:-1]
-        return {
-            "kind": "transport",
-            "from_location": parts[0] if len(parts) > 0 else "",
-            "destination": parts[1] if len(parts) > 1 else "",
-            "project_name": ", ".join(parts[2:]) if len(parts) > 2 else "",
-            "return_included": return_included,
-        }
-
-    return {"kind": "receipt", "project_name": raw}
+    parsed["extra_description"] = extra
+    parsed["cap_amount"] = cap_amount
+    return parsed
 
 
 def parse_save_command(text: str) -> bool:
