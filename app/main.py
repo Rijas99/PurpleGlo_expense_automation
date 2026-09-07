@@ -512,11 +512,13 @@ async def manage_clear_current(request: Request, confirm: str = Form("")):
         flash(request, "Type CLEAR to confirm.", "err")
         return RedirectResponse("/manage", status_code=303)
     counts = clear_current_month(db(), owner_id(request))
+    name = (active_user(request) or {}).get("name") or "this account"
     flash(
         request,
         "Working month cleared "
+        f"for {name} "
         f"({counts['receipts']} receipts, {counts['credit_card']} credit cards, "
-        f"{counts['transport']} trips). Archived months were not touched.",
+        f"{counts['transport']} trips). Other people were not touched.",
     )
     return RedirectResponse("/manage", status_code=303)
 

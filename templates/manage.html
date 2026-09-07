@@ -109,7 +109,7 @@
 
   <form class="card danger-card" method="post" action="/manage/clear-current">
     <h2>Clear working month</h2>
-    <p class="hint">Deletes the current month and starts from zero. Archived months stay. Type <strong>CLEAR</strong> to confirm.</p>
+    <p class="hint">Deletes only <strong>{{ employee_name }}</strong>'s current receipts, credit cards, and trips. Other people are not touched. Archived months stay. Type <strong>CLEAR</strong> to confirm.</p>
     <label>Confirm
       <input type="text" name="confirm" placeholder="CLEAR" autocomplete="off" />
     </label>

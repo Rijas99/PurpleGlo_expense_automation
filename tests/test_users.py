@@ -171,3 +171,53 @@ def test_first_telegram_user_auto_links_admin(tmp_path, monkeypatch):
     assert auto_link_first_telegram(db_path, "222333") is None
     assert get_user_by_telegram(db_path, "222333") is None
     assert colleague["telegram_user_id"] is None
+
+
+def test_clear_working_month_only_selected_person(isolated_db, monkeypatch):
+    monkeypatch.setattr(config.settings, "app_password", "on")
+    admin = [u for u in list_users(isolated_db) if u["role"] == "admin"][0]
+    colleague = add_colleague(isolated_db, name="Ahmed Khan", password="secret99")
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "01-Sep",
+            "description": "Admin lunch",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 16.0,
+            "owner_id": admin["id"],
+        },
+    )
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "01-Sep",
+            "description": "Ahmed coffee",
+            "category": "Food & Beverages",
+            "project_name": "adnoc",
+            "amount": 12.0,
+            "owner_id": colleague["id"],
+        },
+    )
+    with TestClient(app) as client:
+        client.post("/login", data={"username": "rijas", "password": "test-admin"})
+        page = client.get("/manage")
+        assert "Deletes only" in page.text
+        assert "Rijas Ali" in page.text
+        assert "Other people are not touched" in page.text
+        cleared = client.post(
+            "/manage/clear-current",
+            data={"confirm": "CLEAR"},
+            follow_redirects=True,
+        )
+        assert "Rijas Ali" in cleared.text
+        assert "Other people were not touched" in cleared.text
+        client.post("/manage/view-user", data={"user_id": colleague["id"]})
+        other = client.get("/manage")
+        assert "Deletes only" in other.text
+        assert "Ahmed Khan" in other.text
+    assert list_receipts(isolated_db, None, owner_id=admin["id"]) == []
+    leftover = list_receipts(isolated_db, None, owner_id=colleague["id"])
+    assert [r["description"] for r in leftover] == ["Ahmed coffee"]
