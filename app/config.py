@@ -28,6 +28,8 @@ class Settings:
     gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
     turso_database_url: str = _env("TURSO_DATABASE_URL")
     turso_auth_token: str = _env("TURSO_AUTH_TOKEN")
+    github_backup_repo: str = _env("GITHUB_BACKUP_REPO")
+    github_backup_token: str = _env("GITHUB_BACKUP_TOKEN")
 
     def allowed_telegram_ids(self) -> set[str]:
         if not self.telegram_allowed_user_ids:

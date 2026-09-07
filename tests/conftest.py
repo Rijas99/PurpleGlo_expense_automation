@@ -15,5 +15,7 @@ def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setattr(config.settings, "telegram_webhook_url", "")
     monkeypatch.setattr(config.settings, "turso_database_url", "")
     monkeypatch.setattr(config.settings, "turso_auth_token", "")
+    monkeypatch.setattr(config.settings, "github_backup_repo", "")
+    monkeypatch.setattr(config.settings, "github_backup_token", "")
     init_db(path)
     return path

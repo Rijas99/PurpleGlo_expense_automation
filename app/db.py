@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from app.backup import github_backup_enabled, upload_sqlite_backup
 from app.config import settings
 
 
@@ -78,11 +79,40 @@ class _CompatConn:
         return getattr(self._conn, name)
 
 
+class _PersistingConn:
+    def __init__(self, conn, db_path: Path):
+        self._conn = conn
+        self._db_path = db_path
+        self._dirty = False
+
+    def execute(self, sql, params=None):
+        if params is None:
+            return self._conn.execute(sql)
+        return self._conn.execute(sql, params)
+
+    def executescript(self, sql):
+        return self._conn.executescript(sql)
+
+    def commit(self):
+        self._conn.commit()
+        self._dirty = True
+
+    def close(self):
+        try:
+            if self._dirty:
+                upload_sqlite_backup(self._db_path)
+        finally:
+            self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def turso_enabled() -> bool:
     return bool(settings.turso_database_url and settings.turso_auth_token)
 
 
-def _connect(db_path: Path | str):
+def _connect(db_path: Path | str, persist: bool = True):
     if turso_enabled():
         import libsql
 
@@ -92,6 +122,8 @@ def _connect(db_path: Path | str):
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    if persist and github_backup_enabled():
+        return _PersistingConn(conn, path)
     return conn
 
 
@@ -149,7 +181,7 @@ CREATE INDEX IF NOT EXISTS idx_transport_month ON transport(month_slug);
 
 
 def init_db(db_path: Path | str) -> None:
-    conn = _connect(db_path)
+    conn = _connect(db_path, persist=False)
     try:
         conn.executescript(_SCHEMA)
         _migrate_credit_card(conn)

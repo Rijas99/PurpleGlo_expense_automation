@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
+from app.backup import restore_sqlite_backup
 from app.bot import handle_update, register_webhook
 from app.config import ROOT, settings
 from app.constants import CATEGORIES, FOOD_CAP_AMOUNT
@@ -300,6 +301,7 @@ async def _keep_awake():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    restore_sqlite_backup(db())
     init_db(db())
     STATIC.mkdir(exist_ok=True)
     EXPORTS.mkdir(parents=True, exist_ok=True)
