@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+{% block title %}Manage · PurpleGlo{% endblock %}
+{% block content %}
+<section class="head-row">
+  <h1>Manage</h1>
+</section>
+
+<p class="metric">{{ storage.store }} · {{ storage.backup }}</p>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <span class="stat-kicker">Receipts</span>
+    <strong>{{ stats.receipts }}</strong>
+    <span>{{ "%.2f"|format(stats.receipts_total) }} · {{ stats.receipt_photos }} with photo</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-kicker">Credit card</span>
+    <strong>{{ stats.credit_card }}</strong>
+    <span>{{ "%.2f"|format(stats.credit_card_total) }} · {{ stats.credit_card_photos }} with photo</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-kicker">Transport</span>
+    <strong>{{ stats.transport }}</strong>
+    <span>trips this working month</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-kicker">Drafts</span>
+    <strong>{{ stats.drafts }}</strong>
+    <span>Telegram in progress</span>
+  </div>
+</div>
+<p class="hint">Working month: {{ stats.receipts }} receipt{% if stats.receipts != 1 %}s{% endif %} totaling {{ "%.2f"|format(stats.receipts_total) }}. Counts ignore archived months. {{ stats.archived_months }} archived month{% if stats.archived_months != 1 %}s{% endif %} kept in history.</p>
+
+{% if is_admin %}
+<section class="card people-card">
+  <h2>Colleagues</h2>
+  <p class="hint">Add a person here. They sign in on the website with the username shown and the password you set. For Telegram they send <code>join CODE</code> to the bot. You can open their receipts; they only see their own.</p>
+  <form class="people-add" method="post" action="/manage/colleagues">
+    <label>Name
+      <input type="text" name="name" placeholder="Ahmed Khan" required />
+    </label>
+    <label>Password
+      <input type="password" name="password" required />
+    </label>
+    <button type="submit">Add colleague</button>
+  </form>
+  {% if people %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Username</th>
+          <th>Role</th>
+          <th>Telegram</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in people %}
+        <tr>
+          <td>{{ p.name }}</td>
+          <td><code>{{ p.username }}</code></td>
+          <td>{{ p.role }}</td>
+          <td>
+            {% if p.telegram_user_id %}Linked
+            {% elif p.invite_code %}<code>join {{ p.invite_code }}</code>
+            {% else %}—
+            {% endif %}
+          </td>
+          <td>
+            <div class="row-actions wrap">
+              {% if account and p.id == account.id %}
+                {% if viewing_other %}
+                <form method="post" action="/manage/view-user">
+                  <input type="hidden" name="user_id" value="{{ account.id }}" />
+                  <button class="ghost compact" type="submit">Back to mine</button>
+                </form>
+                {% else %}
+                <span class="hint">You</span>
+                {% endif %}
+              {% else %}
+                <form method="post" action="/manage/view-user">
+                  <input type="hidden" name="user_id" value="{{ p.id }}" />
+                  <button class="ghost compact" type="submit">View receipts</button>
+                </form>
+                <form method="post" action="/manage/delete-colleague" onsubmit="return confirm('Remove this person and their expenses?')">
+                  <input type="hidden" name="user_id" value="{{ p.id }}" />
+                  <button class="icon" type="submit">Remove</button>
+                </form>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+<div class="grid manage-grid">
+  <form class="card" method="post" action="/archive" onsubmit="return confirm('Archive this working month and start a new empty one? History is kept.')">
+    <h2>Start new month</h2>
+    <p class="hint">Moves current receipts, credit cards, and trips into <strong>{{ report_month }}</strong> history, then opens a blank working month. Use this after you submit the expense form.</p>
+    <button type="submit">Start new month</button>
+  </form>
+
+  <form class="card danger-card" method="post" action="/manage/clear-current">
+    <h2>Clear working month</h2>
+    <p class="hint">Deletes the current month and starts from zero. Archived months stay. Type <strong>CLEAR</strong> to confirm.</p>
+    <label>Confirm
+      <input type="text" name="confirm" placeholder="CLEAR" autocomplete="off" />
+    </label>
+    <button class="danger" type="submit">Clear working month</button>
+  </form>
+
+  {% if is_admin %}
+  <form class="card" method="post" action="/manage/clear-drafts">
+    <h2>Clear Telegram drafts</h2>
+    <p class="hint">Removes unfinished Telegram receipts that are waiting for a project name or confirmation. Saved receipts are not touched.</p>
+    <button class="ghost" type="submit">Clear drafts</button>
+  </form>
+  {% endif %}
+
+  {% if is_admin %}
+  <form class="card" method="post" action="/manage/restore-backup" enctype="multipart/form-data">
+    <h2>Restore SQLite backup</h2>
+    <p class="hint">Replaces everything (working month and archives) with a downloaded <code>expenses.db</code>. Type <strong>RESTORE</strong>.</p>
+    <input type="file" name="backup" accept=".db,.sqlite,.sqlite3" required />
+    <label>Confirm
+      <input type="text" name="confirm" placeholder="RESTORE" autocomplete="off" />
+    </label>
+    <button class="ghost" type="submit">Restore backup</button>
+  </form>
+  {% endif %}
+</div>
+
+<section class="card backup-card">
+  <h2>Download</h2>
+  <p class="hint">Keep a copy before clearing a month.{% if is_admin %} The SQLite file can be restored above.{% endif %}</p>
+  <div class="row-actions">
+    {% if is_admin %}
+    <a class="btn" href="/backup">Download SQLite backup</a>
+    {% endif %}
+    <a class="edit" href="/export/all">Download {{ looking_at_label }} package</a>
+  </div>
+</section>
+
+<section class="archive-block">
+  <h2>Archived months</h2>
+  {% if archives %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Month</th>
+          <th>Receipts</th>
+          <th>Amount</th>
+          <th>Credit card</th>
+          <th>Transport</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in archives %}
+        <tr>
+          <td>{{ a.label }}</td>
+          <td>{{ a.receipts }}</td>
+          <td class="num">{{ "%.2f"|format(a.receipts_total) }}</td>
+          <td>{{ a.credit_card }}</td>
+          <td>{{ a.transport }}</td>
+          <td>
+            <div class="row-actions wrap">
+              <form method="post" action="/settings">
+                <input type="hidden" name="report_month_month" value="{{ report_month_month }}" />
+                <input type="hidden" name="report_month_year" value="{{ report_month_year }}" />
+                <input type="hidden" name="month_view" value="{{ a.slug }}" />
+                <input type="hidden" name="next" value="/" />
+                <button class="ghost compact" type="submit">View</button>
+              </form>
+              <a class="edit" href="/export/all?month={{ a.slug }}">Download</a>
+              <form method="post" action="/manage/delete-archive" class="inline-confirm">
+                <input type="hidden" name="month_slug" value="{{ a.slug }}" />
+                <input type="text" name="confirm" placeholder="DELETE" autocomplete="off" />
+                <button class="icon" type="submit">Delete</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint">Type DELETE next to an archive to remove only that month. The working month stays.</p>
+  {% else %}
+  <p class="empty">No archived months yet. Use Start new month after you submit.</p>
+  {% endif %}
+</section>
+{% endblock %}

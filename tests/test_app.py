@@ -395,3 +395,168 @@ def test_download_all_button_names_the_month_being_viewed(isolated_db):
         )
         response = client.get("/")
         assert "Download Aug 2026" in response.text
+
+
+def test_manage_page_shows_working_month_counts(isolated_db):
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "01-Sep",
+            "description": "Coffee",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 12.5,
+            "image_bytes": b"jpeg",
+            "image_mime": "image/jpeg",
+        },
+    )
+    with TestClient(app) as client:
+        home = client.get("/")
+        assert 'href="/manage"' in home.text
+        response = client.get("/manage")
+        assert response.status_code == 200
+        assert "Manage" in response.text
+        assert "Working month" in response.text
+        assert "1 receipt" in response.text
+        assert "12.50" in response.text
+        assert "Clear working month" in response.text
+        assert "Start new month" in response.text
+        assert "SQLite backup" in response.text
+
+
+def test_clear_current_requires_confirm_phrase(isolated_db):
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "01-Sep",
+            "description": "Coffee",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 12.5,
+        },
+    )
+    with TestClient(app) as client:
+        refused = client.post(
+            "/manage/clear-current",
+            data={"confirm": "nope"},
+            follow_redirects=True,
+        )
+        assert refused.status_code == 200
+        assert "Type CLEAR" in refused.text
+        from app.db import list_receipts
+
+        assert len(list_receipts(isolated_db, None)) == 1
+        cleared = client.post(
+            "/manage/clear-current",
+            data={"confirm": "CLEAR"},
+            follow_redirects=True,
+        )
+        assert cleared.status_code == 200
+        assert "Working month cleared" in cleared.text
+        assert list_receipts(isolated_db, None) == []
+
+
+def test_delete_archive_from_manage(isolated_db):
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "15-Aug",
+            "description": "August lunch",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 16.0,
+            "month_slug": "Aug_2026",
+        },
+    )
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "01-Sep",
+            "description": "September coffee",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 12.0,
+        },
+    )
+    with TestClient(app) as client:
+        page = client.get("/manage")
+        assert "Aug 2026" in page.text
+        refused = client.post(
+            "/manage/delete-archive",
+            data={"month_slug": "Aug_2026", "confirm": "no"},
+            follow_redirects=True,
+        )
+        assert "Type DELETE" in refused.text
+        deleted = client.post(
+            "/manage/delete-archive",
+            data={"month_slug": "Aug_2026", "confirm": "DELETE"},
+            follow_redirects=True,
+        )
+        assert "Deleted archive Aug 2026" in deleted.text
+        from app.db import list_archived_months, list_receipts
+
+        assert list_archived_months(isolated_db) == []
+        assert list_receipts(isolated_db, None)[0]["description"] == "September coffee"
+
+
+def test_restore_sqlite_from_manage(isolated_db, tmp_path):
+    from app.db import init_db, list_receipts
+
+    src = tmp_path / "restore.db"
+    init_db(src)
+    add_receipt(
+        src,
+        {
+            "ref": 1,
+            "date": "10-Sep",
+            "description": "Restored lunch",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 40.0,
+        },
+    )
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "01-Sep",
+            "description": "Will be replaced",
+            "category": "Food & Beverages",
+            "project_name": "mees",
+            "amount": 9.0,
+        },
+    )
+    with TestClient(app) as client:
+        refused = client.post(
+            "/manage/restore-backup",
+            data={"confirm": "no"},
+            files={"backup": ("restore.db", src.read_bytes(), "application/octet-stream")},
+            follow_redirects=True,
+        )
+        assert "Type RESTORE" in refused.text
+        assert list_receipts(isolated_db, None)[0]["description"] == "Will be replaced"
+        restored = client.post(
+            "/manage/restore-backup",
+            data={"confirm": "RESTORE"},
+            files={"backup": ("restore.db", src.read_bytes(), "application/octet-stream")},
+            follow_redirects=True,
+        )
+        assert "Restored" in restored.text
+        rows = list_receipts(isolated_db, None)
+        assert len(rows) == 1
+        assert rows[0]["description"] == "Restored lunch"
+
+
+def test_clear_drafts_from_manage(isolated_db):
+    from app.db import upsert_draft, working_month_stats
+
+    upsert_draft(isolated_db, "99", "{}")
+    with TestClient(app) as client:
+        response = client.post("/manage/clear-drafts", follow_redirects=True)
+        assert response.status_code == 200
+        assert "Cleared 1 Telegram draft" in response.text
+        assert working_month_stats(isolated_db)["drafts"] == 0

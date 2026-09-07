@@ -15,11 +15,20 @@
         <span>Expense Manager</span>
       </div>
     </div>
+    <div class="top-right">
     <nav>
       <a href="/" class="{% if active == 'receipts' %}on{% endif %}">Receipts</a>
       <a href="/credit-card" class="{% if active == 'cc' %}on{% endif %}">Credit card</a>
       <a href="/transport" class="{% if active == 'transport' %}on{% endif %}">Transport</a>
+      <a href="/manage" class="{% if active == 'manage' %}on{% endif %}">Manage</a>
     </nav>
+    {% if account %}
+    <form class="logout-form" method="post" action="/logout">
+      <span class="who">{{ account.name }}</span>
+      <button type="submit">Sign out</button>
+    </form>
+    {% endif %}
+    </div>
   </header>
 
   <aside class="rail">
@@ -70,11 +79,17 @@
         <span class="pill {% if telegram_ready %}ok{% else %}bad{% endif %}">Telegram {% if telegram_ready %}ready{% else %}off{% endif %}</span>
       </div>
       <p class="meta">{{ employee_name }}</p>
+      <a class="meta" href="/manage">Month, backup, and people</a>
+      {% if is_admin %}
       <a class="meta" href="/backup">Download SQLite backup</a>
+      {% endif %}
     </div>
   </aside>
 
   <main>
+    {% if viewing_other %}
+    <div class="flash warn">Viewing {{ viewing.name }}'s expenses. Changes you make here are theirs.</div>
+    {% endif %}
     {% if flash %}
     <div class="flash {{ flash.kind }}">{{ flash.text }}</div>
     {% endif %}

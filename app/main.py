@@ -15,33 +15,46 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.backup import restore_sqlite_backup
+from app.backup import github_backup_enabled, restore_sqlite_backup
 from app.bot import handle_update, register_webhook
 from app.config import ROOT, settings
 from app.constants import CATEGORIES, FOOD_CAP_AMOUNT
 from app.corrections import format_display_date, get_meal_description, to_input_date
 from app.db import (
+    add_colleague,
     add_credit_card,
     add_receipt,
     add_transport,
     archive_current_month,
+    archived_month_stats,
+    authenticate_user,
+    clear_all_drafts,
+    clear_current_month,
+    delete_archived_month,
+    delete_colleague,
     delete_credit_card,
     delete_receipt,
     delete_transport,
+    export_sqlite_file,
     get_credit_card,
     get_receipt,
     get_transport,
+    get_user,
+    import_sqlite_file,
     init_db,
     list_archived_months,
     list_credit_card,
     list_receipts,
     list_transport,
+    list_users,
     next_receipt_ref,
     project_codes_for_current,
     project_names,
+    turso_enabled,
     update_credit_card,
     update_receipt,
     update_transport,
+    working_month_stats,
 )
 from app.export import (
     build_all_package,
@@ -155,16 +168,62 @@ def pop_flash(request: Request) -> dict | None:
     return request.session.pop("flash", None)
 
 
-def logged_in(request: Request) -> bool:
+def logged_in_user(request: Request) -> dict | None:
+    uid = request.session.get("user_id")
+    if uid:
+        return get_user(db(), int(uid))
     if not settings.app_password:
-        return True
-    return bool(request.session.get("auth"))
+        people = list_users(db())
+        return next((u for u in people if u.get("role") == "admin"), people[0] if people else None)
+    return None
+
+
+def active_user(request: Request) -> dict | None:
+    account = logged_in_user(request)
+    if not account:
+        return None
+    if account.get("role") == "admin":
+        view_id = request.session.get("view_user_id")
+        if view_id:
+            other = get_user(db(), int(view_id))
+            if other:
+                return other
+    return account
+
+
+def owner_id(request: Request) -> int | None:
+    user = active_user(request)
+    return int(user["id"]) if user else None
+
+
+def is_admin(request: Request) -> bool:
+    user = logged_in_user(request)
+    return bool(user and user.get("role") == "admin")
+
+
+def logged_in(request: Request) -> bool:
+    return logged_in_user(request) is not None
 
 
 def require_auth(request: Request):
     if logged_in(request):
         return None
     return RedirectResponse("/login", status_code=303)
+
+
+def require_admin(request: Request, message: str = "Only admin can do that."):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if not is_admin(request):
+        flash(request, message, "err")
+        return RedirectResponse("/manage", status_code=303)
+    return None
+
+
+def export_employee_name(request: Request) -> str:
+    user = active_user(request)
+    return str((user or {}).get("name") or settings.employee_name)
 
 
 def pending_path(request: Request, kind: str = "receipt") -> Path:
@@ -208,17 +267,22 @@ def ctx(request: Request, **extra):
         active = "cc"
     elif path.startswith("/transport"):
         active = "transport"
+    elif path.startswith("/manage"):
+        active = "manage"
     report_month = working_report_month(request)
     month_abbr, year = parse_report_month(report_month)
+    account = logged_in_user(request)
+    viewing = active_user(request)
+    oid = int(viewing["id"]) if viewing else None
     return {
         "request": request,
         "flash": pop_flash(request),
         "active": active,
         "today": datetime.now().strftime("%Y-%m-%d"),
         "categories": CATEGORIES,
-        "project_codes": project_codes_for_current(db()),
-        "project_names": project_names(db()),
-        "archived": list_archived_months(db()),
+        "project_codes": project_codes_for_current(db(), oid),
+        "project_names": project_names(db(), oid),
+        "archived": list_archived_months(db(), oid),
         "month_view": month_slug or "CURRENT",
         "report_month": report_month,
         "report_month_month": month_abbr,
@@ -226,7 +290,13 @@ def ctx(request: Request, **extra):
         "looking_at_label": export_month_label(request),
         "months": MONTH_CHOICES,
         "years": year_choices(year),
-        "employee_name": settings.employee_name,
+        "employee_name": (viewing or {}).get("name") or settings.employee_name,
+        "account": account,
+        "viewing": viewing,
+        "is_admin": bool(account and account.get("role") == "admin"),
+        "viewing_other": bool(
+            account and viewing and account["id"] != viewing["id"]
+        ),
         "gemini_ready": bool(settings.google_api_key),
         "telegram_ready": bool(settings.telegram_bot_token),
         **extra,
@@ -338,24 +408,37 @@ def health():
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
+    if logged_in(request) and settings.app_password:
+        return RedirectResponse("/", status_code=303)
     if not settings.app_password:
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(request, "login.html", {"flash": pop_flash(request)})
 
 
 @app.post("/login")
-def login_submit(request: Request, password: str = Form(...)):
-    if password == settings.app_password:
+def login_submit(request: Request, password: str = Form(...), username: str = Form("")):
+    user = None
+    name = username.strip()
+    if name:
+        user = authenticate_user(db(), name, password)
+    if user is None:
+        user = authenticate_user(db(), "rijas", password)
+    if user is None and settings.app_password and password == settings.app_password:
+        people = list_users(db())
+        user = next((u for u in people if u.get("role") == "admin"), None)
+    if user:
+        request.session["user_id"] = user["id"]
         request.session["auth"] = True
+        request.session.pop("view_user_id", None)
         return RedirectResponse("/", status_code=303)
-    flash(request, "Wrong password", "err")
+    flash(request, "Wrong username or password", "err")
     return RedirectResponse("/login", status_code=303)
 
 
 @app.post("/logout")
 def logout(request: Request):
     request.session.clear()
-    return RedirectResponse("/login", status_code=303)
+    return RedirectResponse("/login" if settings.app_password else "/", status_code=303)
 
 
 @app.post("/settings")
@@ -364,13 +447,15 @@ async def save_settings(
     report_month_month: str = Form(...),
     report_month_year: int = Form(...),
     month_view: str = Form("CURRENT"),
+    next: str = Form(""),
 ):
     gate = require_auth(request)
     if gate:
         return gate
     request.session["report_month"] = format_report_month(report_month_month, report_month_year)
     request.session["month_view"] = month_view
-    return RedirectResponse(request.headers.get("referer") or "/", status_code=303)
+    dest = next.strip() if next.strip().startswith("/") else ""
+    return RedirectResponse(dest or request.headers.get("referer") or "/", status_code=303)
 
 
 @app.post("/archive")
@@ -380,14 +465,183 @@ async def archive_month(request: Request):
         return gate
     label = working_report_month(request)
     try:
-        archive_current_month(db(), slugify(label))
+        archive_current_month(db(), slugify(label), owner_id(request))
         nxt = next_report_month(label)
         request.session["report_month"] = nxt
         request.session["month_view"] = "CURRENT"
         flash(request, f"Archived {label}. Working month is now {nxt}.")
     except Exception as exc:
         flash(request, str(exc), "err")
+    return RedirectResponse(request.headers.get("referer") or "/", status_code=303)
+
+
+def _storage_status() -> dict[str, str]:
+    if turso_enabled():
+        store = "Turso cloud SQLite"
+    else:
+        store = "Local SQLite file"
+    backup = "GitHub backup on" if github_backup_enabled() else "GitHub backup off"
+    return {"store": store, "backup": backup}
+
+
+@app.get("/manage", response_class=HTMLResponse)
+def manage_page(request: Request):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    stats = working_month_stats(db(), owner_id(request))
+    return templates.TemplateResponse(
+        request,
+        "manage.html",
+        ctx(
+            request,
+            stats=stats,
+            archives=archived_month_stats(db(), owner_id(request)),
+            storage=_storage_status(),
+            people=list_users(db()) if is_admin(request) else [],
+        ),
+    )
+
+
+@app.post("/manage/clear-current")
+async def manage_clear_current(request: Request, confirm: str = Form("")):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if confirm.strip().upper() != "CLEAR":
+        flash(request, "Type CLEAR to confirm.", "err")
+        return RedirectResponse("/manage", status_code=303)
+    counts = clear_current_month(db(), owner_id(request))
+    flash(
+        request,
+        "Working month cleared "
+        f"({counts['receipts']} receipts, {counts['credit_card']} credit cards, "
+        f"{counts['transport']} trips). Archived months were not touched.",
+    )
+    return RedirectResponse("/manage", status_code=303)
+
+
+@app.post("/manage/delete-archive")
+async def manage_delete_archive(
+    request: Request,
+    month_slug: str = Form(...),
+    confirm: str = Form(""),
+):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if confirm.strip().upper() != "DELETE":
+        flash(request, "Type DELETE to confirm.", "err")
+        return RedirectResponse("/manage", status_code=303)
+    try:
+        delete_archived_month(db(), month_slug, owner_id(request))
+        flash(request, f"Deleted archive {month_slug.replace('_', ' ')}.")
+        if request.session.get("month_view") == month_slug:
+            request.session["month_view"] = "CURRENT"
+    except Exception as exc:
+        flash(request, str(exc), "err")
+    return RedirectResponse("/manage", status_code=303)
+
+
+@app.post("/manage/clear-drafts")
+async def manage_clear_drafts(request: Request):
+    gate = require_admin(request, "Only admin can clear all Telegram drafts.")
+    if gate:
+        return gate
+    n = clear_all_drafts(db())
+    label = "Telegram draft" if n == 1 else "Telegram drafts"
+    flash(request, f"Cleared {n} {label}.")
+    return RedirectResponse("/manage", status_code=303)
+
+
+@app.post("/manage/restore-backup")
+async def manage_restore_backup(
+    request: Request,
+    confirm: str = Form(""),
+    backup: UploadFile = File(...),
+):
+    gate = require_admin(request, "Only admin can restore a backup.")
+    if gate:
+        return gate
+    if confirm.strip().upper() != "RESTORE":
+        flash(request, "Type RESTORE to confirm.", "err")
+        return RedirectResponse("/manage", status_code=303)
+    raw = await backup.read()
+    if not raw.startswith(b"SQLite format 3"):
+        flash(request, "That file is not a SQLite database.", "err")
+        return RedirectResponse("/manage", status_code=303)
+    dest = PENDING / "restore-upload.db"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(raw)
+    try:
+        import_sqlite_file(dest, db())
+        stats = working_month_stats(db(), owner_id(request))
+        flash(
+            request,
+            f"Restored backup with {stats['receipts']} working-month receipts.",
+        )
+    except Exception as exc:
+        flash(request, str(exc), "err")
+    return RedirectResponse("/manage", status_code=303)
+
+
+@app.post("/manage/colleagues")
+async def manage_add_colleague(
+    request: Request,
+    name: str = Form(...),
+    password: str = Form(...),
+):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if not is_admin(request):
+        flash(request, "Only admin can add colleagues.", "err")
+        return RedirectResponse("/manage", status_code=303)
+    try:
+        person = add_colleague(db(), name, password)
+        flash(
+            request,
+            f"Added {person['name']} (username {person['username']}). "
+            f"Telegram: join {person['invite_code']}",
+        )
+    except Exception as exc:
+        flash(request, str(exc), "err")
+    return RedirectResponse("/manage", status_code=303)
+
+
+@app.post("/manage/view-user")
+async def manage_view_user(request: Request, user_id: int = Form(...)):
+    gate = require_admin(request, "Only admin can view another person's expenses.")
+    if gate:
+        return gate
+    account = logged_in_user(request)
+    if account and int(user_id) == int(account["id"]):
+        request.session.pop("view_user_id", None)
+        flash(request, "Showing your own expenses.")
+        return RedirectResponse("/", status_code=303)
+    other = get_user(db(), int(user_id))
+    if not other:
+        flash(request, "Person not found.", "err")
+        return RedirectResponse("/manage", status_code=303)
+    request.session["view_user_id"] = other["id"]
+    flash(request, f"Viewing {other['name']}'s expenses.")
     return RedirectResponse("/", status_code=303)
+
+
+@app.post("/manage/delete-colleague")
+async def manage_delete_colleague(request: Request, user_id: int = Form(...)):
+    gate = require_admin(request, "Only admin can remove colleagues.")
+    if gate:
+        return gate
+    try:
+        delete_colleague(db(), int(user_id))
+        view_id = request.session.get("view_user_id")
+        if view_id and int(view_id) == int(user_id):
+            request.session.pop("view_user_id", None)
+        flash(request, "Colleague removed.")
+    except Exception as exc:
+        flash(request, str(exc), "err")
+    return RedirectResponse("/manage", status_code=303)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -396,7 +650,7 @@ def receipts_page(request: Request):
     if gate:
         return gate
     month_slug = selected_month(request)
-    rows = list_receipts(db(), month_slug)
+    rows = list_receipts(db(), month_slug, owner_id(request))
     total = sum(float(r["amount"] or 0) for r in rows)
     analysis = request.session.get("receipt_analysis")
     return templates.TemplateResponse(
@@ -476,7 +730,7 @@ async def save_receipt(
     add_receipt(
         db(),
         {
-            "ref": next_receipt_ref(db()),
+            "ref": next_receipt_ref(db(), owner_id(request)),
             "date": format_display_date(date),
             "description": final_desc,
             "category": category,
@@ -485,6 +739,7 @@ async def save_receipt(
             "amount": final_amt,
             "image_bytes": image_bytes,
             "image_mime": image_mime,
+            "owner_id": owner_id(request),
         },
     )
     flash(request, "Receipt saved.")
@@ -499,11 +754,11 @@ def receipts_edit(request: Request, ref: int):
     if selected_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/", status_code=303)
-    row = get_receipt(db(), ref, None)
+    row = get_receipt(db(), ref, None, owner_id(request))
     if not row:
         flash(request, "Receipt not found.", "err")
         return RedirectResponse("/", status_code=303)
-    rows = list_receipts(db(), None)
+    rows = list_receipts(db(), None, owner_id(request))
     total = sum(float(r["amount"] or 0) for r in rows)
     return templates.TemplateResponse(
         request,
@@ -554,7 +809,7 @@ async def receipts_update(
     if replace_image:
         payload["image_bytes"] = await photo.read()
         payload["image_mime"] = photo.content_type or "image/jpeg"
-    if update_receipt(db(), ref, payload, replace_image=replace_image):
+    if update_receipt(db(), ref, payload, replace_image=replace_image, owner_id=owner_id(request)):
         flash(request, f"Updated receipt {ref}.")
     else:
         flash(request, "Receipt not found.", "err")
@@ -569,7 +824,7 @@ async def receipts_delete(request: Request, ref: int):
     if selected_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/", status_code=303)
-    if delete_receipt(db(), ref):
+    if delete_receipt(db(), ref, owner_id(request)):
         flash(request, f"Deleted receipt {ref}.")
     else:
         flash(request, "Receipt not found.", "err")
@@ -581,7 +836,7 @@ def credit_page(request: Request):
     gate = require_auth(request)
     if gate:
         return gate
-    rows = list_credit_card(db(), selected_month(request))
+    rows = list_credit_card(db(), selected_month(request), owner_id(request))
     total = sum(float(r["amount"] or 0) for r in rows)
     return templates.TemplateResponse(
         request,
@@ -670,6 +925,7 @@ async def credit_save(
             "amount": final_amt,
             "image_bytes": image_bytes,
             "image_mime": image_mime,
+            "owner_id": owner_id(request),
         },
     )
     flash(request, "Credit card expense saved.")
@@ -684,11 +940,11 @@ def credit_edit(request: Request, row_id: int):
     if selected_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/credit-card", status_code=303)
-    row = get_credit_card(db(), row_id, None)
+    row = get_credit_card(db(), row_id, None, owner_id(request))
     if not row:
         flash(request, "Expense not found.", "err")
         return RedirectResponse("/credit-card", status_code=303)
-    rows = list_credit_card(db(), None)
+    rows = list_credit_card(db(), None, owner_id(request))
     total = sum(float(r["amount"] or 0) for r in rows)
     return templates.TemplateResponse(
         request,
@@ -736,7 +992,7 @@ async def credit_update(
     if replace_image:
         payload["image_bytes"] = await photo.read()
         payload["image_mime"] = photo.content_type or "image/jpeg"
-    if update_credit_card(db(), row_id, payload, replace_image=replace_image):
+    if update_credit_card(db(), row_id, payload, replace_image=replace_image, owner_id=owner_id(request)):
         flash(request, "Updated credit card expense.")
     else:
         flash(request, "Expense not found.", "err")
@@ -748,7 +1004,7 @@ async def credit_delete(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    delete_credit_card(db(), row_id)
+    delete_credit_card(db(), row_id, owner_id(request))
     flash(request, "Deleted.")
     return RedirectResponse("/credit-card", status_code=303)
 
@@ -758,7 +1014,7 @@ def transport_page(request: Request):
     gate = require_auth(request)
     if gate:
         return gate
-    rows = list_transport(db(), selected_month(request))
+    rows = list_transport(db(), selected_month(request), owner_id(request))
     return templates.TemplateResponse(
         request, "transport.html", ctx(request, rows=rows, editing=None)
     )
@@ -789,6 +1045,7 @@ async def transport_save(
             "return_included": bool(return_included),
             "project_code": project_code.strip(),
             "project_name": project_name.strip(),
+            "owner_id": owner_id(request),
         },
     )
     flash(request, "Transport expense saved.")
@@ -803,11 +1060,11 @@ def transport_edit(request: Request, row_id: int):
     if selected_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/transport", status_code=303)
-    row = get_transport(db(), row_id, None)
+    row = get_transport(db(), row_id, None, owner_id(request))
     if not row:
         flash(request, "Trip not found.", "err")
         return RedirectResponse("/transport", status_code=303)
-    rows = list_transport(db(), None)
+    rows = list_transport(db(), None, owner_id(request))
     form = {
         "date": to_input_date(str(row.get("date") or ""), _date_year(request)),
         "from_location": row.get("from_location") or "",
@@ -849,6 +1106,7 @@ async def transport_update(
             "project_code": project_code.strip(),
             "project_name": project_name.strip(),
         },
+        owner_id=owner_id(request),
     )
     flash(request, "Updated trip." if ok else "Trip not found.", "ok" if ok else "err")
     return RedirectResponse("/transport", status_code=303)
@@ -859,7 +1117,7 @@ async def transport_delete(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    delete_transport(db(), row_id)
+    delete_transport(db(), row_id, owner_id(request))
     flash(request, "Deleted.")
     return RedirectResponse("/transport", status_code=303)
 
@@ -878,7 +1136,8 @@ def export_receipts(request: Request):
             month_slug=month_slug,
             work_dir=EXPORTS,
             template_path=settings.template_path,
-            employee_name=settings.employee_name,
+            employee_name=export_employee_name(request),
+            owner_id=owner_id(request),
         )
     except Exception as exc:
         flash(request, str(exc), "err")
@@ -894,7 +1153,9 @@ def export_cc(request: Request):
     month = export_month_label(request)
     month_slug = selected_month(request)
     try:
-        zip_path = build_credit_card_package(db(), month, month_slug, EXPORTS)
+        zip_path = build_credit_card_package(
+            db(), month, month_slug, EXPORTS, owner_id=owner_id(request)
+        )
     except Exception as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/credit-card", status_code=303)
@@ -915,7 +1176,8 @@ def export_all(request: Request):
             month_slug=month_slug,
             work_dir=EXPORTS,
             template_path=settings.template_path,
-            employee_name=settings.employee_name,
+            employee_name=export_employee_name(request),
+            owner_id=owner_id(request),
         )
     except Exception as exc:
         flash(request, str(exc), "err")
@@ -931,7 +1193,7 @@ def export_transport(request: Request):
     slug = selected_month(request) or slugify(export_month_label(request))
     dest = EXPORTS / f"Transport_{slug}.xlsx"
     try:
-        build_transport_xlsx(db(), selected_month(request), dest)
+        build_transport_xlsx(db(), selected_month(request), dest, owner_id=owner_id(request))
     except Exception as exc:
         flash(request, str(exc), "err")
         return RedirectResponse("/transport", status_code=303)
@@ -944,14 +1206,16 @@ def export_transport(request: Request):
 
 @app.get("/backup")
 def backup(request: Request):
-    gate = require_auth(request)
+    gate = require_admin(request, "Only admin can download the full SQLite backup.")
     if gate:
         return gate
-    path = db()
-    if not path.exists():
-        flash(request, "No database yet.", "err")
-        return RedirectResponse("/", status_code=303)
-    return FileResponse(path, filename="expenses.db", media_type="application/octet-stream")
+    dest = EXPORTS / "expenses.db"
+    try:
+        export_sqlite_file(dest)
+    except Exception as exc:
+        flash(request, str(exc), "err")
+        return RedirectResponse(request.headers.get("referer") or "/", status_code=303)
+    return FileResponse(dest, filename="expenses.db", media_type="application/octet-stream")
 
 
 @app.post("/telegram/webhook")
@@ -969,7 +1233,7 @@ def receipt_image(request: Request, ref: int):
     gate = require_auth(request)
     if gate:
         return gate
-    row = get_receipt(db(), ref, selected_month(request))
+    row = get_receipt(db(), ref, selected_month(request), owner_id(request))
     if row and row.get("image_bytes"):
         return Response(content=row["image_bytes"], media_type=row.get("image_mime") or "image/jpeg")
     return Response(status_code=404)
@@ -980,7 +1244,7 @@ def credit_image(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    row = get_credit_card(db(), row_id, selected_month(request))
+    row = get_credit_card(db(), row_id, selected_month(request), owner_id(request))
     if row and row.get("image_bytes"):
         return Response(content=row["image_bytes"], media_type=row.get("image_mime") or "image/jpeg")
     return Response(status_code=404)

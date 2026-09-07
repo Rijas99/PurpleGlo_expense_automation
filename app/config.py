@@ -22,6 +22,7 @@ class Settings:
     telegram_allowed_user_ids: str = _env("TELEGRAM_ALLOWED_USER_IDS")
     app_password: str = _env("APP_PASSWORD")
     secret_key: str = _env("SECRET_KEY", "purpleglo-dev-secret-change-me")
+    admin_password: str = _env("ADMIN_PASSWORD")
     employee_name: str = _env("EMPLOYEE_NAME", "Rijas Ali")
     database_path: Path = Path(_env("DATABASE_PATH") or str(ROOT / "data" / "expenses.db"))
     template_path: Path = ROOT / "excel format" / "Expense Form.xlsx"

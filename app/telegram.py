@@ -199,6 +199,15 @@ _HELP_PHRASES = {
 }
 
 
+def parse_join_command(text: str) -> str | None:
+    if not text:
+        return None
+    match = re.match(r"^\s*join\s+([A-Za-z0-9]{4,12})\s*$", text.strip(), re.I)
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
 def is_start_command(text: str) -> bool:
     if not text:
         return False
@@ -223,7 +232,8 @@ def commands_help_text() -> str:
         "Transport — text only, no photo:\n"
         "TR, Dubai, Abu Dhabi, adnoc\n"
         "TR, Dubai, Abu Dhabi, adnoc, return\n\n"
-        "Then tap Save or send save."
+        "Then tap Save or send save.\n\n"
+        "If this is your first time, send: join YOURCODE"
     )
 
 

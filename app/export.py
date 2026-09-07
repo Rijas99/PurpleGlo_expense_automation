@@ -53,8 +53,9 @@ def write_receipts_folder(
     dest_dir: Path,
     template_path: Path,
     employee_name: str,
+    owner_id: int | None = None,
 ) -> Path:
-    receipts = list_receipts(db_path, month_slug)
+    receipts = list_receipts(db_path, month_slug, owner_id=owner_id)
     if not receipts:
         raise RuntimeError("No receipts for this month.")
     slug = _month_slug(month, month_slug)
@@ -77,19 +78,26 @@ def build_receipts_package(
     work_dir: Path,
     template_path: Path,
     employee_name: str,
+    owner_id: int | None = None,
 ) -> Path:
     slug = _month_slug(month, month_slug)
     out_dir = work_dir / f"receipts_{slug}"
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    write_receipts_folder(db_path, month, month_slug, out_dir, template_path, employee_name)
+    write_receipts_folder(
+        db_path, month, month_slug, out_dir, template_path, employee_name, owner_id=owner_id
+    )
     return _zip_folder(out_dir, work_dir / f"Receipts_Submission_{slug}.zip")
 
 
 def write_credit_card_folder(
-    db_path: Path | str, month: str, month_slug: str | None, dest_dir: Path
+    db_path: Path | str,
+    month: str,
+    month_slug: str | None,
+    dest_dir: Path,
+    owner_id: int | None = None,
 ) -> Path:
-    rows = list_credit_card(db_path, month_slug)
+    rows = list_credit_card(db_path, month_slug, owner_id=owner_id)
     if not rows:
         raise RuntimeError("No credit card expenses for this month.")
     slug = _month_slug(month, month_slug)
@@ -116,20 +124,28 @@ def write_credit_card_folder(
 
 
 def build_credit_card_package(
-    db_path: Path | str, month: str, month_slug: str | None, work_dir: Path
+    db_path: Path | str,
+    month: str,
+    month_slug: str | None,
+    work_dir: Path,
+    owner_id: int | None = None,
 ) -> Path:
     slug = _month_slug(month, month_slug)
     out_dir = work_dir / f"credit_{slug}"
     if out_dir.exists():
         shutil.rmtree(out_dir)
-    write_credit_card_folder(db_path, month, month_slug, out_dir)
+    write_credit_card_folder(db_path, month, month_slug, out_dir, owner_id=owner_id)
     return _zip_folder(out_dir, work_dir / f"CreditCard_Submission_{slug}.zip")
 
 
 def write_transport_folder(
-    db_path: Path | str, month: str, month_slug: str | None, dest_dir: Path
+    db_path: Path | str,
+    month: str,
+    month_slug: str | None,
+    dest_dir: Path,
+    owner_id: int | None = None,
 ) -> Path:
-    rows = list_transport(db_path, month_slug)
+    rows = list_transport(db_path, month_slug, owner_id=owner_id)
     if not rows:
         raise RuntimeError("No transport expenses for this month.")
     slug = _month_slug(month, month_slug)
@@ -154,13 +170,17 @@ def write_transport_folder(
 
 
 def build_transport_xlsx(
-    db_path: Path | str, month_slug: str | None, dest: Path, month: str = ""
+    db_path: Path | str,
+    month_slug: str | None,
+    dest: Path,
+    month: str = "",
+    owner_id: int | None = None,
 ) -> Path:
     label = month or "export"
     tmp = dest.parent / f"_transport_{_month_slug(label, month_slug)}"
     if tmp.exists():
         shutil.rmtree(tmp)
-    write_transport_folder(db_path, label, month_slug, tmp)
+    write_transport_folder(db_path, label, month_slug, tmp, owner_id=owner_id)
     xlsx = next(tmp.glob("*.xlsx"))
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(xlsx, dest)
@@ -175,6 +195,7 @@ def build_all_package(
     work_dir: Path,
     template_path: Path,
     employee_name: str,
+    owner_id: int | None = None,
 ) -> Path:
     slug = _month_slug(month, month_slug)
     out_dir = work_dir / f"all_{slug}"
@@ -184,18 +205,28 @@ def build_all_package(
     added = 0
     try:
         write_receipts_folder(
-            db_path, month, month_slug, out_dir / "receipts", template_path, employee_name
+            db_path,
+            month,
+            month_slug,
+            out_dir / "receipts",
+            template_path,
+            employee_name,
+            owner_id=owner_id,
         )
         added += 1
     except RuntimeError:
         pass
     try:
-        write_credit_card_folder(db_path, month, month_slug, out_dir / "credit_card")
+        write_credit_card_folder(
+            db_path, month, month_slug, out_dir / "credit_card", owner_id=owner_id
+        )
         added += 1
     except RuntimeError:
         pass
     try:
-        write_transport_folder(db_path, month, month_slug, out_dir / "transport")
+        write_transport_folder(
+            db_path, month, month_slug, out_dir / "transport", owner_id=owner_id
+        )
         added += 1
     except RuntimeError:
         pass

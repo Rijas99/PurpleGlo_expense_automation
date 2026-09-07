@@ -12,8 +12,11 @@ from app.db import (
     add_credit_card,
     add_receipt,
     add_transport,
+    auto_link_first_telegram,
     delete_draft,
     get_draft,
+    get_user_by_telegram,
+    link_telegram_invite,
     next_receipt_ref,
     upsert_draft,
 )
@@ -24,6 +27,7 @@ from app.telegram import (
     format_draft_message,
     is_start_command,
     loads_draft,
+    parse_join_command,
     parse_save_command,
     parse_telegram_note,
 )
@@ -155,7 +159,14 @@ def build_transport_draft(note: dict) -> dict:
     }
 
 
-def _save_if_ready(db_path, chat_id: str, draft: dict, image_bytes: bytes | None, image_mime: str) -> str:
+def _save_if_ready(
+    db_path,
+    chat_id: str,
+    draft: dict,
+    image_bytes: bytes | None,
+    image_mime: str,
+    owner_id: int | None = None,
+) -> str:
     project_name = str(draft.get("project_name") or "").strip()
     if not project_name:
         return "Project name is required. Send the photo again with the project name as the caption, e.g. adnoc"
@@ -176,6 +187,7 @@ def _save_if_ready(db_path, chat_id: str, draft: dict, image_bytes: bytes | None
                 "return_included": bool(draft.get("return_included")),
                 "project_code": str(draft.get("project_code") or "").strip(),
                 "project_name": project_name,
+                "owner_id": owner_id,
             },
         )
         delete_draft(db_path, chat_id)
@@ -193,6 +205,7 @@ def _save_if_ready(db_path, chat_id: str, draft: dict, image_bytes: bytes | None
                 "amount": float(draft.get("amount") or 0),
                 "image_bytes": image_bytes,
                 "image_mime": image_mime or "image/jpeg",
+                "owner_id": owner_id,
             },
         )
         delete_draft(db_path, chat_id)
@@ -202,7 +215,7 @@ def _save_if_ready(db_path, chat_id: str, draft: dict, image_bytes: bytes | None
         return "No photo on this draft. Send the receipt photo again."
     amount = float(draft.get("amount") or 0)
     desc = str(draft.get("description") or "").strip() or "Receipt"
-    ref = next_receipt_ref(db_path)
+    ref = next_receipt_ref(db_path, owner_id)
     add_receipt(
         db_path,
         {
@@ -215,10 +228,26 @@ def _save_if_ready(db_path, chat_id: str, draft: dict, image_bytes: bytes | None
             "amount": amount,
             "image_bytes": image_bytes,
             "image_mime": image_mime or "image/jpeg",
+            "owner_id": owner_id,
         },
     )
     delete_draft(db_path, chat_id)
     return f"Saved receipt #{ref} — {desc} — {amount:.2f}"
+
+
+def _resolve_telegram_user(db_path, user_id) -> dict | None:
+    if user_id is None:
+        return None
+    tid = str(user_id)
+    return get_user_by_telegram(db_path, tid) or auto_link_first_telegram(db_path, tid)
+
+
+def _join_prompt() -> str:
+    return (
+        "This Telegram is not linked yet.\n"
+        "Ask the admin to add you on Manage, then send:\n"
+        "join YOURCODE"
+    )
 
 
 async def handle_update(db_path, update: dict) -> None:
@@ -238,20 +267,51 @@ async def handle_update(db_path, update: dict) -> None:
 
     if chat_id is None:
         return
-    if not user_allowed(user_id):
-        send_message(chat_id, "This bot is private.")
+
+    text = (message.get("text") or message.get("caption") or "").strip() if message else ""
+    join_code = parse_join_command(text)
+    if join_code:
+        if link_telegram_invite(db_path, join_code, str(user_id)):
+            send_message(chat_id, "Linked to your account. You can send receipts now.")
+        else:
+            send_message(chat_id, "That invite code was not found. Ask the admin for a new one from Manage.")
         return
 
+    user = _resolve_telegram_user(db_path, user_id)
+    if not user_allowed(user_id) and not user:
+        send_message(
+            chat_id,
+            "This bot is private. If you were invited, send:\njoin YOURCODE",
+        )
+        return
     if callback:
         data = callback.get("data")
         _api("answerCallbackQuery", callback_query_id=callback["id"])
-        await _handle_text(db_path, str(chat_id), "save" if data == "save" else data or "")
+        if not user:
+            send_message(chat_id, _join_prompt())
+            return
+        await _handle_text(
+            db_path,
+            str(chat_id),
+            "save" if data == "save" else data or "",
+            owner_id=int(user["id"]),
+        )
         return
 
     if not message:
         return
 
-    text = (message.get("text") or message.get("caption") or "").strip()
+    if is_start_command(text) and not image_file_id(message):
+        send_message(chat_id, commands_help_text())
+        if not user:
+            send_message(chat_id, _join_prompt())
+        return
+
+    if not user:
+        send_message(chat_id, _join_prompt())
+        return
+
+    owner = int(user["id"])
     file_id = image_file_id(message)
     note = parse_telegram_note(text)
 
@@ -294,13 +354,13 @@ async def handle_update(db_path, update: dict) -> None:
         return
 
     if text:
-        await _handle_text(db_path, str(chat_id), text)
+        await _handle_text(db_path, str(chat_id), text, owner_id=owner)
         return
 
     send_message(chat_id, "Send a receipt photo, or reply with corrections to the current draft.")
 
 
-async def _handle_text(db_path, chat_id: str, text: str) -> None:
+async def _handle_text(db_path, chat_id: str, text: str, owner_id: int | None = None) -> None:
     if is_start_command(text):
         send_message(chat_id, commands_help_text())
         return
@@ -320,7 +380,9 @@ async def _handle_text(db_path, chat_id: str, text: str) -> None:
         return
 
     if parse_save_command(text):
-        msg = _save_if_ready(db_path, chat_id, _finalize_description(draft), image_bytes, image_mime)
+        msg = _save_if_ready(
+            db_path, chat_id, _finalize_description(draft), image_bytes, image_mime, owner_id=owner_id
+        )
         send_message(chat_id, msg)
         return
 

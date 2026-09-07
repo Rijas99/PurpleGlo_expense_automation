@@ -11,6 +11,8 @@ def isolated_db(tmp_path, monkeypatch):
     path = tmp_path / "expenses.db"
     monkeypatch.setattr(config.settings, "database_path", path)
     monkeypatch.setattr(config.settings, "app_password", "")
+    monkeypatch.setattr(config.settings, "admin_password", "test-admin")
+    monkeypatch.setattr(config.settings, "employee_name", "Rijas Ali")
     monkeypatch.setattr(config.settings, "telegram_bot_token", "")
     monkeypatch.setattr(config.settings, "telegram_webhook_url", "")
     monkeypatch.setattr(config.settings, "turso_database_url", "")

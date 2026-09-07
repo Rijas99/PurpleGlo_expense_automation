@@ -13,9 +13,13 @@
       <div><strong>PurpleGlo</strong><span>Expense Manager</span></div>
     </div>
     {% if flash %}<div class="flash {{ flash.kind }}">{{ flash.text }}</div>{% endif %}
-    <label>Password
-      <input type="password" name="password" autofocus required />
+    <label>Username
+      <input type="text" name="username" autocomplete="username" autofocus required />
     </label>
+    <label>Password
+      <input type="password" name="password" autocomplete="current-password" required />
+    </label>
+    <p class="hint">Username is the first name in lowercase, e.g. rijas</p>
     <button type="submit">Enter</button>
   </form>
 </body>
