@@ -93,10 +93,9 @@ def format_draft_message(draft: dict) -> str:
     lines.extend(
         [
             "",
-            "Caption shortcuts:",
-            "photo + adnoc  →  receipt, project name adnoc",
-            "photo + adnoc / dis: ali and rijas  →  Lunch, ali and rijas",
-            "photo + cap,40  →  cap amount to 40",
+            "Caption: project code, description, 40 or 80",
+            "adnoc, rijas and ali lunch, 80",
+            "Leave a slot blank to keep the receipt value.",
             "photo + CC, adnoc  →  credit card",
             "TR, Dubai, Abu Dhabi, adnoc  →  transport",
             "",
@@ -145,11 +144,52 @@ def parse_telegram_note(text: str) -> dict:
                     "return_included": return_included,
                 }
             else:
-                parsed = {"kind": "receipt", "project_name": remainder}
+                fields = _parse_receipt_caption(remainder)
+                parsed = {
+                    "kind": "receipt",
+                    "project_name": fields["project_name"],
+                    "project_code": fields["project_code"],
+                    "caption_description": fields["caption_description"],
+                }
+                if fields["cap_amount"] is not None and cap_amount is None:
+                    cap_amount = fields["cap_amount"]
 
     parsed["extra_description"] = extra
     parsed["cap_amount"] = cap_amount
+    parsed.setdefault("project_code", "")
+    parsed.setdefault("caption_description", "")
     return parsed
+
+
+def _is_cap_token(text: str) -> bool:
+    try:
+        return float(text) in {40.0, 80.0}
+    except (TypeError, ValueError):
+        return False
+
+
+def _parse_receipt_caption(text: str) -> dict:
+    """project code, description, 40 or 80. A blank slot is left for the receipt."""
+    parts = [part.strip() for part in (text or "").split(",")]
+    code = ""
+    description = ""
+    cap_amount = None
+    if len(parts) <= 1:
+        code = parts[0] if parts else ""
+    elif len(parts) == 2 and _is_cap_token(parts[1]):
+        code = parts[0]
+        cap_amount = float(parts[1])
+    else:
+        code = parts[0]
+        description = parts[1] if len(parts) > 1 else ""
+        if len(parts) > 2 and _is_cap_token(parts[2]):
+            cap_amount = float(parts[2])
+    return {
+        "project_code": code,
+        "project_name": code,
+        "caption_description": description,
+        "cap_amount": cap_amount,
+    }
 
 
 def parse_save_command(text: str) -> bool:
@@ -221,10 +261,11 @@ def is_start_command(text: str) -> bool:
 def commands_help_text() -> str:
     return (
         "How to add expenses:\n\n"
-        "Receipts — send a photo. Caption = project name, optional extra lines:\n"
-        "adnoc\n"
-        "dis: ali and rijas\n"
-        "cap,40\n\n"
+        "Receipts — send a photo. Caption is:\n"
+        "project code, description, 40 or 80\n"
+        "adnoc, rijas and ali lunch, 80\n"
+        "Leave a slot blank to keep what is on the receipt:\n"
+        "adnoc, , 80\n\n"
         "Food bills become Breakfast / Lunch / Dinner from the time on the receipt.\n"
         "Breakfast 5:00–11:15, Lunch 11:15–18:15, Dinner after that.\n\n"
         "Credit card — send a photo, caption:\n"

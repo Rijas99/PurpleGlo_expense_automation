@@ -50,6 +50,7 @@ from app.db import (
     next_receipt_ref,
     project_codes_for_current,
     project_names,
+    set_project_code,
     turso_enabled,
     update_credit_card,
     update_receipt,
@@ -63,6 +64,7 @@ from app.export import (
     build_transport_xlsx,
 )
 from app.gemini import analyze_receipt_bytes
+from app.months import current_month_label, previous_month_label, previous_month_slug
 from app.telegram import slugify
 
 logging.basicConfig(level=logging.INFO)
@@ -94,11 +96,6 @@ MONTH_CHOICES = [
     ("Dec", "December"),
 ]
 MONTH_ABBRS = [abbr for abbr, _ in MONTH_CHOICES]
-
-
-def current_month_label() -> str:
-    now = datetime.now()
-    return f"{MONTH_ABBRS[now.month - 1]} {now.year}"
 
 
 def parse_report_month(label: str | None) -> tuple[str, int]:
@@ -141,9 +138,12 @@ def year_choices(selected_year: int) -> list[int]:
 
 
 def working_report_month(request: Request) -> str:
-    raw = request.session.get("report_month") or current_month_label()
-    abbr, year = parse_report_month(raw)
-    return format_report_month(abbr, year)
+    return current_month_label()
+
+
+def can_edit_month(request: Request) -> bool:
+    slug = selected_month(request)
+    return slug is None or slug == previous_month_slug()
 
 
 def export_month_label(request: Request) -> str:
@@ -157,6 +157,8 @@ def selected_month(request: Request) -> str | None:
     value = request.query_params.get("month") or request.session.get("month_view")
     if not value or value == "CURRENT":
         return None
+    if value == "PREVIOUS":
+        return previous_month_slug()
     return value
 
 
@@ -261,6 +263,13 @@ def _receipt_form_from_row(row: dict, year: int) -> dict:
 
 def ctx(request: Request, **extra):
     month_slug = selected_month(request)
+    prev_slug = previous_month_slug()
+    if month_slug is None:
+        month_view = "CURRENT"
+    elif month_slug == prev_slug:
+        month_view = "PREVIOUS"
+    else:
+        month_view = month_slug
     path = request.url.path
     active = "receipts"
     if path.startswith("/credit-card"):
@@ -283,7 +292,10 @@ def ctx(request: Request, **extra):
         "project_codes": project_codes_for_current(db(), oid),
         "project_names": project_names(db(), oid),
         "archived": list_archived_months(db(), oid),
-        "month_view": month_slug or "CURRENT",
+        "month_view": month_view,
+        "can_edit": month_slug is None or month_slug == prev_slug,
+        "current_label": current_month_label(),
+        "previous_label": previous_month_label(),
         "report_month": report_month,
         "report_month_month": month_abbr,
         "report_month_year": year,
@@ -444,16 +456,19 @@ def logout(request: Request):
 @app.post("/settings")
 async def save_settings(
     request: Request,
-    report_month_month: str = Form(...),
-    report_month_year: int = Form(...),
     month_view: str = Form("CURRENT"),
     next: str = Form(""),
 ):
     gate = require_auth(request)
     if gate:
         return gate
-    request.session["report_month"] = format_report_month(report_month_month, report_month_year)
-    request.session["month_view"] = month_view
+    view = (month_view or "CURRENT").strip()
+    if view in {"", "CURRENT"}:
+        request.session["month_view"] = "CURRENT"
+    elif view in {"PREVIOUS", previous_month_slug()}:
+        request.session["month_view"] = "PREVIOUS"
+    else:
+        request.session["month_view"] = view
     dest = next.strip() if next.strip().startswith("/") else ""
     return RedirectResponse(dest or request.headers.get("referer") or "/", status_code=303)
 
@@ -713,7 +728,7 @@ async def save_receipt(
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Switch to CURRENT month to add receipts.", "err")
         return RedirectResponse("/", status_code=303)
     if not project_name.strip():
@@ -732,7 +747,7 @@ async def save_receipt(
     add_receipt(
         db(),
         {
-            "ref": next_receipt_ref(db(), owner_id(request)),
+            "ref": next_receipt_ref(db(), owner_id(request), month_slug=selected_month(request)),
             "date": format_display_date(date),
             "description": final_desc,
             "category": category,
@@ -742,6 +757,7 @@ async def save_receipt(
             "image_bytes": image_bytes,
             "image_mime": image_mime,
             "owner_id": owner_id(request),
+            "month_slug": selected_month(request),
         },
     )
     flash(request, "Receipt saved.")
@@ -753,14 +769,14 @@ def receipts_edit(request: Request, ref: int):
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/", status_code=303)
-    row = get_receipt(db(), ref, None, owner_id(request))
+    row = get_receipt(db(), ref, selected_month(request), owner_id(request))
     if not row:
         flash(request, "Receipt not found.", "err")
         return RedirectResponse("/", status_code=303)
-    rows = list_receipts(db(), None, owner_id(request))
+    rows = list_receipts(db(), selected_month(request), owner_id(request))
     total = sum(float(r["amount"] or 0) for r in rows)
     return templates.TemplateResponse(
         request,
@@ -792,7 +808,7 @@ async def receipts_update(
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/", status_code=303)
     if not project_name.strip():
@@ -811,7 +827,14 @@ async def receipts_update(
     if replace_image:
         payload["image_bytes"] = await photo.read()
         payload["image_mime"] = photo.content_type or "image/jpeg"
-    if update_receipt(db(), ref, payload, replace_image=replace_image, owner_id=owner_id(request)):
+    if update_receipt(
+        db(),
+        ref,
+        payload,
+        replace_image=replace_image,
+        owner_id=owner_id(request),
+        month_slug=selected_month(request),
+    ):
         flash(request, f"Updated receipt {ref}.")
     else:
         flash(request, "Receipt not found.", "err")
@@ -823,10 +846,10 @@ async def receipts_delete(request: Request, ref: int):
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/", status_code=303)
-    if delete_receipt(db(), ref, owner_id(request)):
+    if delete_receipt(db(), ref, owner_id(request), month_slug=selected_month(request)):
         flash(request, f"Deleted receipt {ref}.")
     else:
         flash(request, "Receipt not found.", "err")
@@ -899,7 +922,7 @@ async def credit_save(
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Switch to CURRENT month to add expenses.", "err")
         return RedirectResponse("/credit-card", status_code=303)
     final_desc, final_amt = _capped_desc_amount(description, category, amount, cap_food)
@@ -928,6 +951,7 @@ async def credit_save(
             "image_bytes": image_bytes,
             "image_mime": image_mime,
             "owner_id": owner_id(request),
+            "month_slug": selected_month(request),
         },
     )
     flash(request, "Credit card expense saved.")
@@ -939,14 +963,14 @@ def credit_edit(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/credit-card", status_code=303)
-    row = get_credit_card(db(), row_id, None, owner_id(request))
+    row = get_credit_card(db(), row_id, selected_month(request), owner_id(request))
     if not row:
         flash(request, "Expense not found.", "err")
         return RedirectResponse("/credit-card", status_code=303)
-    rows = list_credit_card(db(), None, owner_id(request))
+    rows = list_credit_card(db(), selected_month(request), owner_id(request))
     total = sum(float(r["amount"] or 0) for r in rows)
     return templates.TemplateResponse(
         request,
@@ -978,7 +1002,7 @@ async def credit_update(
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/credit-card", status_code=303)
     final_desc, final_amt = _capped_desc_amount(description, category, amount, cap_food)
@@ -994,7 +1018,14 @@ async def credit_update(
     if replace_image:
         payload["image_bytes"] = await photo.read()
         payload["image_mime"] = photo.content_type or "image/jpeg"
-    if update_credit_card(db(), row_id, payload, replace_image=replace_image, owner_id=owner_id(request)):
+    if update_credit_card(
+        db(),
+        row_id,
+        payload,
+        replace_image=replace_image,
+        owner_id=owner_id(request),
+        month_slug=selected_month(request),
+    ):
         flash(request, "Updated credit card expense.")
     else:
         flash(request, "Expense not found.", "err")
@@ -1006,7 +1037,7 @@ async def credit_delete(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    delete_credit_card(db(), row_id, owner_id(request))
+    delete_credit_card(db(), row_id, owner_id(request), month_slug=selected_month(request))
     flash(request, "Deleted.")
     return RedirectResponse("/credit-card", status_code=303)
 
@@ -1035,7 +1066,7 @@ async def transport_save(
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Switch to CURRENT month to add expenses.", "err")
         return RedirectResponse("/transport", status_code=303)
     add_transport(
@@ -1048,6 +1079,7 @@ async def transport_save(
             "project_code": project_code.strip(),
             "project_name": project_name.strip(),
             "owner_id": owner_id(request),
+            "month_slug": selected_month(request),
         },
     )
     flash(request, "Transport expense saved.")
@@ -1059,14 +1091,14 @@ def transport_edit(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/transport", status_code=303)
-    row = get_transport(db(), row_id, None, owner_id(request))
+    row = get_transport(db(), row_id, selected_month(request), owner_id(request))
     if not row:
         flash(request, "Trip not found.", "err")
         return RedirectResponse("/transport", status_code=303)
-    rows = list_transport(db(), None, owner_id(request))
+    rows = list_transport(db(), selected_month(request), owner_id(request))
     form = {
         "date": to_input_date(str(row.get("date") or ""), _date_year(request)),
         "from_location": row.get("from_location") or "",
@@ -1094,7 +1126,7 @@ async def transport_update(
     gate = require_auth(request)
     if gate:
         return gate
-    if selected_month(request):
+    if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/transport", status_code=303)
     ok = update_transport(
@@ -1109,6 +1141,7 @@ async def transport_update(
             "project_name": project_name.strip(),
         },
         owner_id=owner_id(request),
+        month_slug=selected_month(request),
     )
     flash(request, "Updated trip." if ok else "Trip not found.", "ok" if ok else "err")
     return RedirectResponse("/transport", status_code=303)
@@ -1119,8 +1152,77 @@ async def transport_delete(request: Request, row_id: int):
     gate = require_auth(request)
     if gate:
         return gate
-    delete_transport(db(), row_id, owner_id(request))
+    delete_transport(db(), row_id, owner_id(request), month_slug=selected_month(request))
     flash(request, "Deleted.")
+    return RedirectResponse("/transport", status_code=303)
+
+
+@app.post("/receipts/{ref}/project-code")
+async def receipts_project_code(request: Request, ref: int, project_code: str = Form("")):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if not can_edit_month(request):
+        flash(request, "Older months are read-only.", "err")
+        return RedirectResponse("/", status_code=303)
+    if set_project_code(
+        db(),
+        "receipts",
+        "ref",
+        ref,
+        project_code.strip(),
+        month_slug=selected_month(request),
+        owner_id=owner_id(request),
+    ):
+        flash(request, "Project code updated.")
+    else:
+        flash(request, "Receipt not found.", "err")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/credit-card/{row_id}/project-code")
+async def credit_project_code(request: Request, row_id: int, project_code: str = Form("")):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if not can_edit_month(request):
+        flash(request, "Older months are read-only.", "err")
+        return RedirectResponse("/credit-card", status_code=303)
+    if set_project_code(
+        db(),
+        "credit_card",
+        "id",
+        row_id,
+        project_code.strip(),
+        month_slug=selected_month(request),
+        owner_id=owner_id(request),
+    ):
+        flash(request, "Project code updated.")
+    else:
+        flash(request, "Expense not found.", "err")
+    return RedirectResponse("/credit-card", status_code=303)
+
+
+@app.post("/transport/{row_id}/project-code")
+async def transport_project_code(request: Request, row_id: int, project_code: str = Form("")):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    if not can_edit_month(request):
+        flash(request, "Older months are read-only.", "err")
+        return RedirectResponse("/transport", status_code=303)
+    if set_project_code(
+        db(),
+        "transport",
+        "id",
+        row_id,
+        project_code.strip(),
+        month_slug=selected_month(request),
+        owner_id=owner_id(request),
+    ):
+        flash(request, "Project code updated.")
+    else:
+        flash(request, "Trip not found.", "err")
     return RedirectResponse("/transport", status_code=303)
 
 

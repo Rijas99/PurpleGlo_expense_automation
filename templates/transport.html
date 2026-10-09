@@ -20,10 +20,18 @@
         <td>{{ r.from_location }}</td>
         <td>{{ r.destination }}</td>
         <td>{% if r.return_included %}Yes{% else %}No{% endif %}</td>
-        <td>{{ r.project_code }}</td>
+        <td>
+          {% if can_edit %}
+          <form method="post" action="/transport/{{ r.id }}/project-code">
+            <input class="inline-code" name="project_code" list="codes" value="{{ r.project_code }}" onchange="this.form.submit()" />
+          </form>
+          {% else %}
+          {{ r.project_code }}
+          {% endif %}
+        </td>
         <td>{{ r.project_name }}</td>
         <td>
-          {% if month_view == 'CURRENT' %}
+          {% if can_edit %}
           <div class="row-actions">
             <a class="edit" href="/transport/{{ r.id }}/edit">Edit</a>
             <form method="post" action="/transport/{{ r.id }}/delete">
@@ -39,7 +47,7 @@
     </tbody>
   </table>
 </div>
-{% if month_view == 'CURRENT' %}
+{% if can_edit %}
 {% set a = analysis or {} %}
 <form class="card" method="post" action="{% if editing %}/transport/{{ editing.id }}/update{% else %}/transport/save{% endif %}">
   <h2>{% if editing %}Update trip{% else %}Add trip{% endif %}</h2>

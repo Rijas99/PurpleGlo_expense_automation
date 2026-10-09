@@ -78,6 +78,44 @@ def test_photo_caption_dis_adds_note_to_food_description():
     assert "capped at 40" in draft["description"]
 
 
+def test_photo_caption_sets_code_description_and_cap():
+    from app.bot import build_receipt_draft
+
+    draft = build_receipt_draft(
+        {
+            "date": "2026-08-15",
+            "time": "13:00",
+            "amount": 120,
+            "description": "Restaurant meal",
+            "category": "Food & Beverages",
+        },
+        caption="adnoc, rijas and ali lunch, 80",
+    )
+    assert draft["project_code"] == "adnoc"
+    assert draft["project_name"] == "adnoc"
+    assert draft["description"].startswith("rijas and ali lunch")
+    assert draft["amount"] == 80.0
+    assert "capped at 80" in draft["description"]
+
+
+def test_photo_caption_blank_description_keeps_receipt():
+    from app.bot import build_receipt_draft
+
+    draft = build_receipt_draft(
+        {
+            "date": "2026-08-15",
+            "time": "13:00",
+            "amount": 30,
+            "description": "Restaurant meal",
+            "category": "Food & Beverages",
+        },
+        caption="adnoc, , 80",
+    )
+    assert draft["project_code"] == "adnoc"
+    assert draft["description"] == "Lunch"
+    assert draft["amount"] == 30.0
+
+
 def test_photo_caption_cc_sets_credit_card_kind():
     from app.bot import build_receipt_draft
 

@@ -32,11 +32,19 @@
         <td>{{ r.date }}</td>
         <td>{{ r.description }}</td>
         <td>{{ r.category }}</td>
-        <td>{{ r.project_code }}</td>
+        <td>
+          {% if can_edit %}
+          <form method="post" action="/receipts/{{ r.ref }}/project-code">
+            <input class="inline-code" name="project_code" list="codes" value="{{ r.project_code }}" onchange="this.form.submit()" />
+          </form>
+          {% else %}
+          {{ r.project_code }}
+          {% endif %}
+        </td>
         <td>{{ r.project_name }}</td>
         <td class="num">{{ "%.2f"|format(r.amount) }}</td>
         <td>
-          {% if month_view == 'CURRENT' %}
+          {% if can_edit %}
           <div class="row-actions">
             <a class="edit" href="/receipts/{{ r.ref }}/edit">Edit</a>
             <form method="post" action="/receipts/{{ r.ref }}/delete" onsubmit="return confirm('Delete receipt {{ r.ref }}?')">
@@ -53,7 +61,7 @@
   </table>
 </div>
 
-{% if month_view == 'CURRENT' %}
+{% if can_edit %}
 <div class="grid">
   {% if not editing %}
   <form class="card" method="post" action="/receipts/analyze" enctype="multipart/form-data">

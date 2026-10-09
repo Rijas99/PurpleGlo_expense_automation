@@ -46,9 +46,12 @@ def get_meal_description(time_obj) -> str:
 
 
 def compose_description(draft: dict) -> str:
+    override = str(draft.get("caption_description") or "").strip()
     extra = str(draft.get("extra_description") or "").strip()
     category = str(draft.get("category") or "")
-    if category == "Food & Beverages":
+    if override:
+        text = override
+    elif category == "Food & Beverages":
         meal = get_meal_description(draft.get("time"))
         text = f"{meal}, {extra}" if extra else meal
     else:

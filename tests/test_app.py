@@ -46,30 +46,47 @@ def test_home_renders_receipts_page():
         assert "PurpleGlo" in response.text
 
 
-def test_sidebar_uses_month_and_year_selects():
+def test_sidebar_uses_automatic_month():
+    from app.months import current_month_label, previous_month_label
+
     with TestClient(app) as client:
         response = client.get("/")
-        assert 'name="report_month_month"' in response.text
-        assert 'name="report_month_year"' in response.text
-        assert 'name="report_month"' not in response.text.replace("report_month_month", "").replace("report_month_year", "")
-        assert ">Apply<" not in response.text
+        assert 'name="report_month_month"' not in response.text
+        assert 'name="report_month_year"' not in response.text
+        assert current_month_label() in response.text
+        assert previous_month_label() in response.text
         assert "Look at" not in response.text
 
 
-def test_save_settings_sets_report_month_from_selects(isolated_db):
+def test_previous_month_can_add_receipt(isolated_db):
+    from app.months import previous_month_label, previous_month_slug
+
     with TestClient(app) as client:
-        response = client.post(
+        opened = client.post(
             "/settings",
+            data={"month_view": "PREVIOUS"},
+            follow_redirects=True,
+        )
+        assert previous_month_label() in opened.text
+        saved = client.post(
+            "/receipts/save",
             data={
-                "report_month_month": "Sep",
-                "report_month_year": "2026",
-                "month_view": "CURRENT",
+                "date": "2026-09-02",
+                "description": "Missed bill",
+                "category": "Parking",
+                "project_code": "P9",
+                "project_name": "adnoc",
+                "amount": "15",
             },
             follow_redirects=True,
         )
-        assert response.status_code == 200
-        assert 'value="Sep" selected' in response.text
-        assert 'value="2026" selected' in response.text
+        assert "Missed bill" in saved.text
+        from app.db import list_receipts
+
+        rows = list_receipts(isolated_db, previous_month_slug())
+        assert rows[0]["description"] == "Missed bill"
+        current = client.post("/settings", data={"month_view": "CURRENT"}, follow_redirects=True)
+        assert "Missed bill" not in current.text
 
 
 def test_save_receipt_then_list(isolated_db):
@@ -137,6 +154,7 @@ def test_credit_card_zip_includes_bill_photo(isolated_db):
         names = zipfile.ZipFile(io.BytesIO(response.content)).namelist()
         assert any(n.endswith("1.jpg") for n in names)
         assert any(n.endswith(".xlsx") for n in names)
+        assert any(n.endswith(".pdf") for n in names)
 
 
 def test_download_all_includes_receipts_cc_and_transport(isolated_db):
@@ -196,7 +214,7 @@ def test_next_report_month_rolls_year():
     assert next_report_month("Dec 2026") == "Jan 2027"
 
 
-def test_archive_advances_working_month(isolated_db):
+def test_inline_project_code_saves_without_edit_form(isolated_db):
     add_receipt(
         isolated_db,
         {
@@ -210,20 +228,17 @@ def test_archive_advances_working_month(isolated_db):
         },
     )
     with TestClient(app) as client:
-        client.post(
-            "/settings",
-            data={
-                "report_month_month": "Aug",
-                "report_month_year": "2026",
-                "month_view": "CURRENT",
-            },
+        page = client.get("/")
+        assert 'action="/receipts/1/project-code"' in page.text
+        saved = client.post(
+            "/receipts/1/project-code",
+            data={"project_code": "250909-PDS-303"},
+            follow_redirects=True,
         )
-        response = client.post("/archive", follow_redirects=True)
-        assert response.status_code == 200
-        assert 'value="Sep" selected' in response.text
-        assert 'value="2026" selected' in response.text
-        assert "Look at" in response.text
-        assert "Aug 2026" in response.text
+        assert "250909-PDS-303" in saved.text
+        from app.db import list_receipts
+
+        assert list_receipts(isolated_db, None)[0]["project_code"] == "250909-PDS-303"
 
 
 def test_download_all_uses_looked_at_archived_month(isolated_db):
@@ -259,11 +274,7 @@ def test_download_all_uses_looked_at_archived_month(isolated_db):
     with TestClient(app) as client:
         client.post(
             "/settings",
-            data={
-                "report_month_month": "Sep",
-                "report_month_year": "2026",
-                "month_view": "Aug_2026",
-            },
+            data={"month_view": "Aug_2026"},
         )
         response = client.get("/export/all")
         assert response.status_code == 200
@@ -384,17 +395,11 @@ def test_project_names_shown_in_datalist(isolated_db):
 
 
 def test_download_all_button_names_the_month_being_viewed(isolated_db):
+    from app.months import current_month_label
+
     with TestClient(app) as client:
-        client.post(
-            "/settings",
-            data={
-                "report_month_month": "Aug",
-                "report_month_year": "2026",
-                "month_view": "CURRENT",
-            },
-        )
         response = client.get("/")
-        assert "Download Aug 2026" in response.text
+        assert f"Download {current_month_label()}" in response.text
 
 
 def test_manage_page_shows_working_month_counts(isolated_db):
@@ -421,7 +426,7 @@ def test_manage_page_shows_working_month_counts(isolated_db):
         assert "1 receipt" in response.text
         assert "12.50" in response.text
         assert "Clear working month" in response.text
-        assert "Start new month" in response.text
+        assert "automatically" in response.text
         assert "SQLite backup" in response.text
 
 

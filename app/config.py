@@ -26,7 +26,7 @@ class Settings:
     employee_name: str = _env("EMPLOYEE_NAME", "Rijas Ali")
     database_path: Path = Path(_env("DATABASE_PATH") or str(ROOT / "data" / "expenses.db"))
     template_path: Path = ROOT / "excel format" / "Expense Form.xlsx"
-    gemini_model: str = _env("GEMINI_MODEL", "gemini-2.5-flash")
+    gemini_model: str = _env("GEMINI_MODEL", "gemini-3.8-flash")
     turso_database_url: str = _env("TURSO_DATABASE_URL")
     turso_auth_token: str = _env("TURSO_AUTH_TOKEN")
     github_backup_repo: str = _env("GITHUB_BACKUP_REPO")

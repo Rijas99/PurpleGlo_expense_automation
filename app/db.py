@@ -188,6 +188,10 @@ CREATE TABLE IF NOT EXISTS drafts (
     image_mime TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_receipts_month ON receipts(month_slug);
 CREATE INDEX IF NOT EXISTS idx_cc_month ON credit_card(month_slug);
 CREATE INDEX IF NOT EXISTS idx_transport_month ON transport(month_slug);
@@ -201,9 +205,34 @@ def init_db(db_path: Path | str) -> None:
         _migrate_credit_card(conn)
         _migrate_owner_columns(conn)
         _seed_admin(conn)
+        _rollover_open_month(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _rollover_open_month(conn) -> None:
+    """When the calendar month changes, keep the open bucket on the new month."""
+    from app.months import current_month_slug
+
+    current = current_month_slug()
+    row = conn.execute("SELECT value FROM app_meta WHERE key = 'open_month'").fetchone()
+    stored = row["value"] if row else None
+    if stored and stored != current:
+        for table in ("receipts", "credit_card", "transport"):
+            conn.execute(
+                f"UPDATE {table} SET month_slug = ? WHERE month_slug IS NULL",
+                (stored,),
+            )
+    if stored == current:
+        return
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value) VALUES ('open_month', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (current,),
+    )
 
 
 def _migrate_credit_card(conn) -> None:
@@ -475,10 +504,12 @@ def list_receipts(
         conn.close()
 
 
-def next_receipt_ref(db_path: Path | str, owner_id: int | None = None) -> int:
+def next_receipt_ref(
+    db_path: Path | str, owner_id: int | None = None, month_slug: str | None = None
+) -> int:
     conn = _connect(db_path)
     try:
-        where, params = _scope(None, owner_id)
+        where, params = _scope(month_slug, owner_id)
         row = conn.execute(
             f"SELECT COALESCE(MAX(ref), 0) AS m FROM receipts WHERE {where}",
             params,
@@ -518,10 +549,12 @@ def add_receipt(db_path: Path | str, data: dict[str, Any]) -> None:
         conn.close()
 
 
-def delete_receipt(db_path: Path | str, ref: int, owner_id: int | None = None) -> bool:
+def delete_receipt(
+    db_path: Path | str, ref: int, owner_id: int | None = None, month_slug: str | None = None
+) -> bool:
     conn = _connect(db_path)
     try:
-        where, params = _scope(None, owner_id)
+        where, params = _scope(month_slug, owner_id)
         cur = conn.execute(
             f"DELETE FROM receipts WHERE ref = ? AND {where}",
             [ref, *params],
@@ -529,15 +562,15 @@ def delete_receipt(db_path: Path | str, ref: int, owner_id: int | None = None) -
         if cur.rowcount <= 0:
             conn.commit()
             return False
-        _renumber_current_receipts(conn, owner_id)
+        _renumber_current_receipts(conn, owner_id, month_slug)
         conn.commit()
         return True
     finally:
         conn.close()
 
 
-def _renumber_current_receipts(conn, owner_id: int | None = None) -> None:
-    where, params = _scope(None, owner_id)
+def _renumber_current_receipts(conn, owner_id: int | None = None, month_slug: str | None = None) -> None:
+    where, params = _scope(month_slug, owner_id)
     rows = conn.execute(
         f"SELECT id FROM receipts WHERE {where} ORDER BY ref, id",
         params,
@@ -582,7 +615,7 @@ def add_credit_card(db_path: Path | str, data: dict[str, Any]) -> None:
         owner = _resolve_owner_id(conn, data.get("owner_id"))
         ref = data.get("ref")
         if ref is None:
-            where, params = _scope(None, owner)
+            where, params = _scope(data.get("month_slug"), owner)
             row = conn.execute(
                 f"SELECT COALESCE(MAX(ref), 0) AS m FROM credit_card WHERE {where}",
                 params,
@@ -614,16 +647,15 @@ def add_credit_card(db_path: Path | str, data: dict[str, Any]) -> None:
         conn.close()
 
 
-def delete_credit_card(db_path: Path | str, row_id: int, owner_id: int | None = None) -> bool:
+def delete_credit_card(
+    db_path: Path | str, row_id: int, owner_id: int | None = None, month_slug: str | None = None
+) -> bool:
     conn = _connect(db_path)
     try:
-        extra = " AND owner_id = ?" if owner_id is not None else ""
-        params: list = [row_id]
-        if owner_id is not None:
-            params.append(owner_id)
+        where, params = _scope(month_slug, owner_id)
         cur = conn.execute(
-            f"DELETE FROM credit_card WHERE id = ? AND month_slug IS NULL{extra}",
-            params,
+            f"DELETE FROM credit_card WHERE id = ? AND {where}",
+            [row_id, *params],
         )
         if cur.rowcount <= 0:
             conn.commit()
@@ -685,16 +717,15 @@ def add_transport(db_path: Path | str, data: dict[str, Any]) -> None:
         conn.close()
 
 
-def delete_transport(db_path: Path | str, row_id: int, owner_id: int | None = None) -> bool:
+def delete_transport(
+    db_path: Path | str, row_id: int, owner_id: int | None = None, month_slug: str | None = None
+) -> bool:
     conn = _connect(db_path)
     try:
-        extra = " AND owner_id = ?" if owner_id is not None else ""
-        params: list = [row_id]
-        if owner_id is not None:
-            params.append(owner_id)
+        where, params = _scope(month_slug, owner_id)
         cur = conn.execute(
-            f"DELETE FROM transport WHERE id = ? AND month_slug IS NULL{extra}",
-            params,
+            f"DELETE FROM transport WHERE id = ? AND {where}",
+            [row_id, *params],
         )
         conn.commit()
         return cur.rowcount > 0
@@ -956,18 +987,18 @@ def update_receipt(
     data: dict[str, Any],
     replace_image: bool = False,
     owner_id: int | None = None,
+    month_slug: str | None = None,
 ) -> bool:
     conn = _connect(db_path)
     try:
-        extra = " AND owner_id = ?" if owner_id is not None else ""
-        owner_params = (owner_id,) if owner_id is not None else ()
+        month_sql, month_params = _scope(month_slug, owner_id)
         if replace_image:
             cur = conn.execute(
                 f"""
                 UPDATE receipts SET
                     date = ?, description = ?, category = ?, project_code = ?,
                     project_name = ?, amount = ?, image_bytes = ?, image_mime = ?
-                WHERE ref = ? AND month_slug IS NULL{extra}
+                WHERE ref = ? AND {month_sql}
                 """,
                 (
                     str(data["date"]),
@@ -979,7 +1010,7 @@ def update_receipt(
                     data.get("image_bytes"),
                     data.get("image_mime") or "image/jpeg",
                     ref,
-                    *owner_params,
+                    *month_params,
                 ),
             )
         else:
@@ -988,7 +1019,7 @@ def update_receipt(
                 UPDATE receipts SET
                     date = ?, description = ?, category = ?, project_code = ?,
                     project_name = ?, amount = ?
-                WHERE ref = ? AND month_slug IS NULL{extra}
+                WHERE ref = ? AND {month_sql}
                 """,
                 (
                     str(data["date"]),
@@ -998,7 +1029,7 @@ def update_receipt(
                     str(data.get("project_name") or ""),
                     float(data["amount"]),
                     ref,
-                    *owner_params,
+                    *month_params,
                 ),
             )
         conn.commit()
@@ -1028,18 +1059,18 @@ def update_credit_card(
     data: dict[str, Any],
     replace_image: bool = False,
     owner_id: int | None = None,
+    month_slug: str | None = None,
 ) -> bool:
     conn = _connect(db_path)
     try:
-        extra = " AND owner_id = ?" if owner_id is not None else ""
-        owner_params = (owner_id,) if owner_id is not None else ()
+        month_sql, month_params = _scope(month_slug, owner_id)
         if replace_image:
             cur = conn.execute(
                 f"""
                 UPDATE credit_card SET
                     date = ?, description = ?, category = ?, project_code = ?,
                     project_name = ?, amount = ?, image_bytes = ?, image_mime = ?
-                WHERE id = ? AND month_slug IS NULL{extra}
+                WHERE id = ? AND {month_sql}
                 """,
                 (
                     str(data["date"]),
@@ -1051,7 +1082,7 @@ def update_credit_card(
                     data.get("image_bytes"),
                     data.get("image_mime") or "image/jpeg",
                     row_id,
-                    *owner_params,
+                    *month_params,
                 ),
             )
         else:
@@ -1060,7 +1091,7 @@ def update_credit_card(
                 UPDATE credit_card SET
                     date = ?, description = ?, category = ?, project_code = ?,
                     project_name = ?, amount = ?
-                WHERE id = ? AND month_slug IS NULL{extra}
+                WHERE id = ? AND {month_sql}
                 """,
                 (
                     str(data["date"]),
@@ -1070,7 +1101,7 @@ def update_credit_card(
                     str(data.get("project_name") or ""),
                     float(data["amount"]),
                     row_id,
-                    *owner_params,
+                    *month_params,
                 ),
             )
         conn.commit()
@@ -1095,18 +1126,21 @@ def get_transport(
 
 
 def update_transport(
-    db_path: Path | str, row_id: int, data: dict[str, Any], owner_id: int | None = None
+    db_path: Path | str,
+    row_id: int,
+    data: dict[str, Any],
+    owner_id: int | None = None,
+    month_slug: str | None = None,
 ) -> bool:
     conn = _connect(db_path)
     try:
-        extra = " AND owner_id = ?" if owner_id is not None else ""
-        owner_params = (owner_id,) if owner_id is not None else ()
+        month_sql, month_params = _scope(month_slug, owner_id)
         cur = conn.execute(
             f"""
             UPDATE transport SET
                 date = ?, from_location = ?, destination = ?, return_included = ?,
                 project_code = ?, project_name = ?
-            WHERE id = ? AND month_slug IS NULL{extra}
+            WHERE id = ? AND {month_sql}
             """,
             (
                 str(data["date"]),
@@ -1116,8 +1150,34 @@ def update_transport(
                 str(data.get("project_code") or ""),
                 str(data.get("project_name") or ""),
                 row_id,
-                *owner_params,
+                *month_params,
             ),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_project_code(
+    db_path: Path | str,
+    table: str,
+    id_column: str,
+    row_id: int,
+    project_code: str,
+    month_slug: str | None = None,
+    owner_id: int | None = None,
+) -> bool:
+    if table not in {"receipts", "credit_card", "transport"}:
+        raise ValueError(table)
+    if id_column not in {"ref", "id"}:
+        raise ValueError(id_column)
+    conn = _connect(db_path)
+    try:
+        where, params = _scope(month_slug, owner_id)
+        cur = conn.execute(
+            f"UPDATE {table} SET project_code = ? WHERE {id_column} = ? AND {where}",
+            [project_code, row_id, *params],
         )
         conn.commit()
         return cur.rowcount > 0

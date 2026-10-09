@@ -44,6 +44,26 @@ def test_greetings_ask_for_commands():
     assert is_start_command("TR, Dubai, Abu Dhabi, adnoc") is False
 
 
+def test_caption_code_description_and_cap():
+    note = parse_telegram_note("adnoc, rijas and ali lunch, 80")
+    assert note["kind"] == "receipt"
+    assert note["project_code"] == "adnoc"
+    assert note["project_name"] == "adnoc"
+    assert note["caption_description"] == "rijas and ali lunch"
+    assert note["cap_amount"] == 80.0
+
+
+def test_caption_blank_slots_are_ignored():
+    note = parse_telegram_note("adnoc, , 80")
+    assert note["project_code"] == "adnoc"
+    assert note["caption_description"] == ""
+    assert note["cap_amount"] == 80.0
+    note = parse_telegram_note(", rijas and ali lunch,")
+    assert note["project_code"] == ""
+    assert note["caption_description"] == "rijas and ali lunch"
+    assert note["cap_amount"] is None
+
+
 def test_caption_plain_text_is_project_name():
     note = parse_telegram_note("adnoc")
     assert note["kind"] == "receipt"

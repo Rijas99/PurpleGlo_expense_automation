@@ -101,11 +101,10 @@
 {% endif %}
 
 <div class="grid manage-grid">
-  <form class="card" method="post" action="/archive" onsubmit="return confirm('Archive this working month and start a new empty one? History is kept.')">
-    <h2>Start new month</h2>
-    <p class="hint">Moves current receipts, credit cards, and trips into <strong>{{ report_month }}</strong> history, then opens a blank working month. Use this after you submit the expense form.</p>
-    <button type="submit">Start new month</button>
-  </form>
+  <section class="card">
+    <h2>Months</h2>
+    <p class="hint">This month is <strong>{{ current_label }}</strong> automatically. Use <strong>Add or edit {{ previous_label }}</strong> on the left if a bill was missed last month.</p>
+  </section>
 
   <form class="card danger-card" method="post" action="/manage/clear-current">
     <h2>Clear working month</h2>
@@ -174,8 +173,6 @@
           <td>
             <div class="row-actions wrap">
               <form method="post" action="/settings">
-                <input type="hidden" name="report_month_month" value="{{ report_month_month }}" />
-                <input type="hidden" name="report_month_year" value="{{ report_month_year }}" />
                 <input type="hidden" name="month_view" value="{{ a.slug }}" />
                 <input type="hidden" name="next" value="/" />
                 <button class="ghost compact" type="submit">View</button>
@@ -195,7 +192,7 @@
   </div>
   <p class="hint">Type DELETE next to an archive to remove only that month. The working month stays.</p>
   {% else %}
-  <p class="empty">No archived months yet. Use Start new month after you submit.</p>
+  <p class="empty">No older months yet. This month and last month stay on the main pages.</p>
   {% endif %}
 </section>
 {% endblock %}

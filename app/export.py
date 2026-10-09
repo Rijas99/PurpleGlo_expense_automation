@@ -40,6 +40,36 @@ def _write_bills(rows: list[dict], bills_dir: Path) -> None:
             continue
         name = rec.get("ref") if rec.get("ref") not in (None, "") else i
         (bills_dir / f"{name}.jpg").write_bytes(blob)
+        _write_bill_pdf(blob, bills_dir / f"{name}.pdf")
+
+
+def _write_bill_pdf(blob: bytes, dest: Path) -> None:
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+
+        img = Image.open(BytesIO(blob))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img.save(dest, "PDF", resolution=150.0)
+    except Exception:
+        return
+
+
+def _write_summary_pdf(title: str, lines: list[str], dest: Path) -> None:
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (1240, 1754), "white")
+    draw = ImageDraw.Draw(img)
+    y = 48
+    for line in [title, ""] + lines:
+        draw.text((48, y), str(line)[:120], fill="black")
+        y += 32
+        if y > 1680:
+            break
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    img.save(dest, "PDF", resolution=150.0)
 
 
 def _month_slug(month: str, month_slug: str | None) -> str:
@@ -68,6 +98,14 @@ def write_receipts_folder(
         employee_name=employee_name,
     )
     _write_bills(receipts, dest_dir / f"bills_{slug}")
+    _write_summary_pdf(
+        f"Expense form {month}",
+        [
+            f"{r.get('ref', '')}  {r.get('date', '')}  {r.get('description', '')}  {r.get('amount', '')}"
+            for r in receipts
+        ],
+        dest_dir / f"Expense_Form_{slug}.pdf",
+    )
     return dest_dir
 
 
@@ -120,6 +158,14 @@ def write_credit_card_folder(
         dest_dir / f"CreditCard_{slug}.xlsx",
     )
     _write_bills(rows, dest_dir / f"bills_{slug}")
+    _write_summary_pdf(
+        f"Credit card {month}",
+        [
+            f"{r.get('date', '')}  {r.get('description', '')}  {r.get('amount', '')}"
+            for r in rows
+        ],
+        dest_dir / f"CreditCard_{slug}.pdf",
+    )
     return dest_dir
 
 
@@ -165,6 +211,14 @@ def write_transport_folder(
         mapped,
         ["Date", "From", "Destination", "Return Included", "Project Code", "Project Name"],
         dest_dir / f"Transport_{slug}.xlsx",
+    )
+    _write_summary_pdf(
+        f"Transport {month}",
+        [
+            f"{r.get('date', '')}  {r.get('from_location', '')} → {r.get('destination', '')}"
+            for r in rows
+        ],
+        dest_dir / f"Transport_{slug}.pdf",
     )
     return dest_dir
 

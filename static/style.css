@@ -82,10 +82,16 @@ nav a.on, nav a:hover { background: rgba(255,255,255,0.12); }
   text-transform: uppercase;
   color: #6b5a70;
 }
-.month-pick {
-  display: grid;
-  grid-template-columns: 1.4fr 0.9fr;
-  gap: 8px;
+.month-now {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 750;
+}
+input.inline-code {
+  width: 9.5rem;
+  min-width: 7rem;
+  padding: 6px 8px;
+  font-size: 13px;
 }
 .month-pick label { margin-top: 0; }
 .rail .btn { margin: 0; }

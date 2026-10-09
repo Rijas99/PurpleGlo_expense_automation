@@ -33,44 +33,21 @@
 
   <aside class="rail">
     <form method="post" action="/settings" class="rail-form">
-      <p class="rail-kicker">Report month</p>
-      <div class="month-pick">
-        <label>Month
-          <select name="report_month_month" onchange="this.form.submit()">
-            {% for abbr, name in months %}
-            <option value="{{ abbr }}" {% if abbr == report_month_month %}selected{% endif %}>{{ name }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>Year
-          <select name="report_month_year" onchange="this.form.submit()">
-            {% for y in years %}
-            <option value="{{ y }}" {% if y == report_month_year %}selected{% endif %}>{{ y }}</option>
-            {% endfor %}
-          </select>
-        </label>
-      </div>
-      <p class="hint">Keep this on the month you will submit. Example: leave August selected until you submit in the first week of September.</p>
-      {% if archived %}
-      <label>Look at
-        <select name="month_view" onchange="this.form.submit()">
-          <option value="CURRENT" {% if month_view == 'CURRENT' %}selected{% endif %}>Working month ({{ report_month }})</option>
-          {% for m in archived %}
-          <option value="{{ m }}" {% if month_view == m %}selected{% endif %}>{{ m.replace('_', ' ') }} — archived</option>
-          {% endfor %}
-        </select>
-      </label>
-      {% else %}
+      <p class="rail-kicker">This month</p>
+      <p class="month-now">{{ current_label }}</p>
+      <p class="hint">New expenses go to {{ current_label }} automatically.</p>
+      {% if month_view == 'PREVIOUS' %}
       <input type="hidden" name="month_view" value="CURRENT" />
+      <button class="ghost" type="submit">Back to {{ current_label }}</button>
+      {% else %}
+      <input type="hidden" name="month_view" value="PREVIOUS" />
+      <button class="ghost" type="submit">Add or edit {{ previous_label }}</button>
       {% endif %}
     </form>
 
     <div class="rail-actions">
       <a class="btn" href="/export/all">Download {{ looking_at_label }}</a>
-      <p class="hint">Receipts, credit card, and transport for the month you are looking at.</p>
-      <form method="post" action="/archive" onsubmit="return confirm('Archive current month and start a new one?')">
-        <button class="ghost" type="submit">Start new month</button>
-      </form>
+      <p class="hint">Excel, PDF, and bill photos for {{ looking_at_label }}.</p>
     </div>
 
     <div class="rail-status">
@@ -93,8 +70,10 @@
     {% if flash %}
     <div class="flash {{ flash.kind }}">{{ flash.text }}</div>
     {% endif %}
-    {% if month_view != 'CURRENT' %}
-    <div class="flash warn">Viewing archived month {{ month_view.replace('_', ' ') }} (read-only add).</div>
+    {% if month_view == 'PREVIOUS' %}
+    <div class="flash warn">Editing {{ previous_label }}. Receipts you add here stay in {{ previous_label }}.</div>
+    {% elif not can_edit %}
+    <div class="flash warn">Viewing {{ looking_at_label }}. This older month is read-only.</div>
     {% endif %}
     {% block content %}{% endblock %}
   </main>
