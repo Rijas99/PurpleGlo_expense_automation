@@ -53,8 +53,10 @@ def test_sidebar_uses_automatic_month():
         response = client.get("/")
         assert 'name="report_month_month"' not in response.text
         assert 'name="report_month_year"' not in response.text
+        assert 'name="month_view"' in response.text
         assert current_month_label() in response.text
         assert previous_month_label() in response.text
+        assert "Start new month" not in response.text
         assert "Look at" not in response.text
 
 
@@ -105,7 +107,7 @@ def test_save_receipt_then_list(isolated_db):
         )
         assert response.status_code == 200
         assert "Lunch" in response.text
-        assert "Alpha" in response.text
+        assert "P1" in response.text
 
 
 def test_export_zip_uses_template(isolated_db, tmp_path):
@@ -212,6 +214,31 @@ def test_download_all_includes_receipts_cc_and_transport(isolated_db):
 def test_next_report_month_rolls_year():
     assert next_report_month("Aug 2026") == "Sep 2026"
     assert next_report_month("Dec 2026") == "Jan 2027"
+
+
+def test_inline_description_saves_from_the_table(isolated_db):
+    add_receipt(
+        isolated_db,
+        {
+            "ref": 1,
+            "date": "15-Aug",
+            "description": "Lunch",
+            "category": "Food & Beverages",
+            "project_code": "P1",
+            "project_name": "Alpha",
+            "amount": 40,
+        },
+    )
+    with TestClient(app) as client:
+        saved = client.post(
+            "/receipts/1/description",
+            data={"description": "Team lunch"},
+            follow_redirects=True,
+        )
+        assert "Team lunch" in saved.text
+        from app.db import list_receipts
+
+        assert list_receipts(isolated_db, None)[0]["description"] == "Team lunch"
 
 
 def test_inline_project_code_saves_without_edit_form(isolated_db):
@@ -389,9 +416,10 @@ def test_project_names_shown_in_datalist(isolated_db):
     )
     with TestClient(app) as client:
         response = client.get("/")
-        assert 'list="names"' in response.text
-        assert 'id="names"' in response.text
-        assert "adnoc" in response.text
+        assert 'name="project_name"' not in response.text
+        assert 'list="names"' not in response.text
+        assert 'action="/receipts/1/description"' in response.text
+        assert 'action="/receipts/1/project-code"' in response.text
 
 
 def test_download_all_button_names_the_month_being_viewed(isolated_db):

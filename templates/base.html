@@ -33,16 +33,15 @@
 
   <aside class="rail">
     <form method="post" action="/settings" class="rail-form">
-      <p class="rail-kicker">This month</p>
-      <p class="month-now">{{ current_label }}</p>
-      <p class="hint">New expenses go to {{ current_label }} automatically.</p>
-      {% if month_view == 'PREVIOUS' %}
-      <input type="hidden" name="month_view" value="CURRENT" />
-      <button class="ghost" type="submit">Back to {{ current_label }}</button>
-      {% else %}
-      <input type="hidden" name="month_view" value="PREVIOUS" />
-      <button class="ghost" type="submit">Add or edit {{ previous_label }}</button>
-      {% endif %}
+      <p class="rail-kicker">Report month</p>
+      <label>Month
+        <select name="month_view" onchange="this.form.submit()">
+          {% for label, slug in month_choices %}
+          <option value="{{ slug }}" {% if slug == active_slug %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <p class="hint">Choosing {{ looking_at_label }} shows that month's expenses. New receipts with no month chosen go to {{ current_label }}.</p>
     </form>
 
     <div class="rail-actions">
@@ -70,10 +69,8 @@
     {% if flash %}
     <div class="flash {{ flash.kind }}">{{ flash.text }}</div>
     {% endif %}
-    {% if month_view == 'PREVIOUS' %}
-    <div class="flash warn">Editing {{ previous_label }}. Receipts you add here stay in {{ previous_label }}.</div>
-    {% elif not can_edit %}
-    <div class="flash warn">Viewing {{ looking_at_label }}. This older month is read-only.</div>
+    {% if active_slug != current_label.replace(' ', '_') %}
+    <div class="flash warn">Showing {{ looking_at_label }}. Receipts you add here stay in {{ looking_at_label }}.</div>
     {% endif %}
     {% block content %}{% endblock %}
   </main>

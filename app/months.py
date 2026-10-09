@@ -42,3 +42,35 @@ def current_month_slug(now: datetime | None = None) -> str:
 
 def previous_month_slug(now: datetime | None = None) -> str:
     return month_slug(previous_month_label(now))
+
+
+def recent_month_options(count: int = 12, now: datetime | None = None) -> list[tuple[str, str]]:
+    moment = now or datetime.now()
+    year, month = moment.year, moment.month
+    options: list[tuple[str, str]] = []
+    for _ in range(count):
+        label = f"{MONTH_ABBRS[month - 1]} {year}"
+        options.append((label, month_slug(label)))
+        month -= 1
+        if month == 0:
+            month = 12
+            year -= 1
+    return options
+
+
+def month_slug_from_display_date(value: str, now: datetime | None = None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    moment = now or datetime.now()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y", "%d-%b", "%d-%B"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+        year = parsed.year if "%Y" in fmt else moment.year
+        month = parsed.month
+        if "%Y" not in fmt and month > moment.month:
+            year -= 1
+        return f"{MONTH_ABBRS[month - 1]}_{year}"
+    return None

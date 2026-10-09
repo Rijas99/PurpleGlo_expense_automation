@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -206,6 +207,8 @@ def init_db(db_path: Path | str) -> None:
         _migrate_owner_columns(conn)
         _seed_admin(conn)
         _rollover_open_month(conn)
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            _backfill_month_slugs(conn)
         conn.commit()
     finally:
         conn.close()
@@ -233,6 +236,23 @@ def _rollover_open_month(conn) -> None:
         """,
         (current,),
     )
+
+
+def _backfill_month_slugs(conn) -> None:
+    """Give open rows a real month from the date on the expense."""
+    from app.months import current_month_slug, month_slug_from_display_date
+
+    fallback = current_month_slug()
+    for table in ("receipts", "credit_card", "transport"):
+        rows = conn.execute(
+            f"SELECT id, date FROM {table} WHERE month_slug IS NULL"
+        ).fetchall()
+        for row in rows:
+            slug = month_slug_from_display_date(str(row["date"] or "")) or fallback
+            conn.execute(
+                f"UPDATE {table} SET month_slug = ? WHERE id = ?",
+                (slug, row["id"]),
+            )
 
 
 def _migrate_credit_card(conn) -> None:
@@ -326,9 +346,14 @@ def _public_user(row) -> dict[str, Any]:
 
 
 def _scope(month_slug: str | None, owner_id: int | None) -> tuple[str, list]:
+    from app.months import current_month_slug
+
     parts = []
     params: list = []
-    if month_slug:
+    if month_slug and month_slug == current_month_slug():
+        parts.append("(month_slug IS NULL OR month_slug = ?)")
+        params.append(month_slug)
+    elif month_slug:
         parts.append("month_slug = ?")
         params.append(month_slug)
     else:
@@ -746,6 +771,9 @@ def list_archived_months(db_path: Path | str, owner_id: int | None = None) -> li
             )
             for row in cur.fetchall():
                 months.add(row["month_slug"])
+        from app.months import current_month_slug
+
+        months.discard(current_month_slug())
         return sorted(months, reverse=True)
     finally:
         conn.close()
@@ -1152,6 +1180,35 @@ def update_transport(
                 row_id,
                 *month_params,
             ),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_row_field(
+    db_path: Path | str,
+    table: str,
+    id_column: str,
+    row_id: int,
+    column: str,
+    value: str,
+    month_slug: str | None = None,
+    owner_id: int | None = None,
+) -> bool:
+    if table not in {"receipts", "credit_card", "transport"}:
+        raise ValueError(table)
+    if id_column not in {"ref", "id"}:
+        raise ValueError(id_column)
+    if column not in {"project_code", "description"}:
+        raise ValueError(column)
+    conn = _connect(db_path)
+    try:
+        where, params = _scope(month_slug, owner_id)
+        cur = conn.execute(
+            f"UPDATE {table} SET {column} = ? WHERE {id_column} = ? AND {where}",
+            [value, row_id, *params],
         )
         conn.commit()
         return cur.rowcount > 0

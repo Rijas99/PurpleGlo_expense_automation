@@ -51,6 +51,7 @@ from app.db import (
     project_codes_for_current,
     project_names,
     set_project_code,
+    set_row_field,
     turso_enabled,
     update_credit_card,
     update_receipt,
@@ -64,7 +65,13 @@ from app.export import (
     build_transport_xlsx,
 )
 from app.gemini import analyze_receipt_bytes
-from app.months import current_month_label, previous_month_label, previous_month_slug
+from app.months import (
+    current_month_label,
+    current_month_slug,
+    previous_month_label,
+    previous_month_slug,
+    recent_month_options,
+)
 from app.telegram import slugify
 
 logging.basicConfig(level=logging.INFO)
@@ -142,8 +149,7 @@ def working_report_month(request: Request) -> str:
 
 
 def can_edit_month(request: Request) -> bool:
-    slug = selected_month(request)
-    return slug is None or slug == previous_month_slug()
+    return True
 
 
 def export_month_label(request: Request) -> str:
@@ -156,7 +162,7 @@ def export_month_label(request: Request) -> str:
 def selected_month(request: Request) -> str | None:
     value = request.query_params.get("month") or request.session.get("month_view")
     if not value or value == "CURRENT":
-        return None
+        return current_month_slug()
     if value == "PREVIOUS":
         return previous_month_slug()
     return value
@@ -250,6 +256,10 @@ def _date_year(request: Request) -> int:
     return parse_report_month(export_month_label(request))[1]
 
 
+def _project_code(project_code: str, project_name: str = "") -> str:
+    return (project_code or "").strip() or (project_name or "").strip()
+
+
 def _receipt_form_from_row(row: dict, year: int) -> dict:
     return {
         "date": to_input_date(str(row.get("date") or ""), year),
@@ -263,13 +273,7 @@ def _receipt_form_from_row(row: dict, year: int) -> dict:
 
 def ctx(request: Request, **extra):
     month_slug = selected_month(request)
-    prev_slug = previous_month_slug()
-    if month_slug is None:
-        month_view = "CURRENT"
-    elif month_slug == prev_slug:
-        month_view = "PREVIOUS"
-    else:
-        month_view = month_slug
+    month_view = "CURRENT" if month_slug == current_month_slug() else (month_slug or "CURRENT")
     path = request.url.path
     active = "receipts"
     if path.startswith("/credit-card"):
@@ -283,6 +287,12 @@ def ctx(request: Request, **extra):
     account = logged_in_user(request)
     viewing = active_user(request)
     oid = int(viewing["id"]) if viewing else None
+    choices = recent_month_options()
+    seen = {slug for _, slug in choices}
+    for slug in list_archived_months(db(), oid):
+        if slug not in seen:
+            choices.append((slug.replace("_", " "), slug))
+            seen.add(slug)
     return {
         "request": request,
         "flash": pop_flash(request),
@@ -293,7 +303,9 @@ def ctx(request: Request, **extra):
         "project_names": project_names(db(), oid),
         "archived": list_archived_months(db(), oid),
         "month_view": month_view,
-        "can_edit": month_slug is None or month_slug == prev_slug,
+        "active_slug": month_slug,
+        "month_choices": choices,
+        "can_edit": True,
         "current_label": current_month_label(),
         "previous_label": previous_month_label(),
         "report_month": report_month,
@@ -721,7 +733,7 @@ async def save_receipt(
     description: str = Form(...),
     category: str = Form(...),
     project_code: str = Form(""),
-    project_name: str = Form(...),
+    project_name: str = Form(""),
     amount: float = Form(...),
     cap_food: str = Form(""),
 ):
@@ -731,8 +743,9 @@ async def save_receipt(
     if not can_edit_month(request):
         flash(request, "Switch to CURRENT month to add receipts.", "err")
         return RedirectResponse("/", status_code=303)
-    if not project_name.strip():
-        flash(request, "Project name is required.", "err")
+    code = _project_code(project_code, project_name)
+    if not code:
+        flash(request, "Project code is required.", "err")
         return RedirectResponse("/", status_code=303)
 
     final_desc, final_amt = _capped_desc_amount(description, category, amount, cap_food)
@@ -751,8 +764,8 @@ async def save_receipt(
             "date": format_display_date(date),
             "description": final_desc,
             "category": category,
-            "project_code": project_code.strip(),
-            "project_name": project_name.strip(),
+            "project_code": code,
+            "project_name": code,
             "amount": final_amt,
             "image_bytes": image_bytes,
             "image_mime": image_mime,
@@ -800,7 +813,7 @@ async def receipts_update(
     description: str = Form(...),
     category: str = Form(...),
     project_code: str = Form(""),
-    project_name: str = Form(...),
+    project_name: str = Form(""),
     amount: float = Form(...),
     cap_food: str = Form(""),
     photo: UploadFile | None = File(None),
@@ -811,16 +824,16 @@ async def receipts_update(
     if not can_edit_month(request):
         flash(request, "Archived months are read-only.", "err")
         return RedirectResponse("/", status_code=303)
-    if not project_name.strip():
-        flash(request, "Project name is required.", "err")
+    if not _project_code(project_code, project_name):
+        flash(request, "Project code is required.", "err")
         return RedirectResponse("/", status_code=303)
     final_desc, final_amt = _capped_desc_amount(description, category, amount, cap_food)
     payload = {
         "date": format_display_date(date),
         "description": final_desc,
         "category": category,
-        "project_code": project_code.strip(),
-        "project_name": project_name.strip(),
+        "project_code": _project_code(project_code, project_name),
+        "project_name": _project_code(project_code, project_name),
         "amount": final_amt,
     }
     replace_image = bool(photo and photo.filename)
@@ -914,7 +927,7 @@ async def credit_save(
     description: str = Form(...),
     category: str = Form(...),
     project_code: str = Form(""),
-    project_name: str = Form(...),
+    project_name: str = Form(""),
     amount: float = Form(...),
     cap_food: str = Form(""),
     photo: UploadFile | None = File(None),
@@ -945,8 +958,8 @@ async def credit_save(
             "date": format_display_date(date),
             "description": final_desc,
             "category": category,
-            "project_code": project_code.strip(),
-            "project_name": project_name.strip(),
+            "project_code": _project_code(project_code, project_name),
+            "project_name": _project_code(project_code, project_name),
             "amount": final_amt,
             "image_bytes": image_bytes,
             "image_mime": image_mime,
@@ -994,7 +1007,7 @@ async def credit_update(
     description: str = Form(...),
     category: str = Form(...),
     project_code: str = Form(""),
-    project_name: str = Form(...),
+    project_name: str = Form(""),
     amount: float = Form(...),
     cap_food: str = Form(""),
     photo: UploadFile | None = File(None),
@@ -1010,8 +1023,8 @@ async def credit_update(
         "date": format_display_date(date),
         "description": final_desc,
         "category": category,
-        "project_code": project_code.strip(),
-        "project_name": project_name.strip(),
+        "project_code": _project_code(project_code, project_name),
+        "project_name": _project_code(project_code, project_name),
         "amount": final_amt,
     }
     replace_image = bool(photo and photo.filename)
@@ -1060,7 +1073,7 @@ async def transport_save(
     from_location: str = Form(...),
     destination: str = Form(...),
     project_code: str = Form(""),
-    project_name: str = Form(...),
+    project_name: str = Form(""),
     return_included: str = Form(""),
 ):
     gate = require_auth(request)
@@ -1076,8 +1089,8 @@ async def transport_save(
             "from_location": from_location.strip(),
             "destination": destination.strip(),
             "return_included": bool(return_included),
-            "project_code": project_code.strip(),
-            "project_name": project_name.strip(),
+            "project_code": _project_code(project_code, project_name),
+            "project_name": _project_code(project_code, project_name),
             "owner_id": owner_id(request),
             "month_slug": selected_month(request),
         },
@@ -1120,7 +1133,7 @@ async def transport_update(
     from_location: str = Form(...),
     destination: str = Form(...),
     project_code: str = Form(""),
-    project_name: str = Form(...),
+    project_name: str = Form(""),
     return_included: str = Form(""),
 ):
     gate = require_auth(request)
@@ -1137,8 +1150,8 @@ async def transport_update(
             "from_location": from_location.strip(),
             "destination": destination.strip(),
             "return_included": bool(return_included),
-            "project_code": project_code.strip(),
-            "project_name": project_name.strip(),
+            "project_code": _project_code(project_code, project_name),
+            "project_name": _project_code(project_code, project_name),
         },
         owner_id=owner_id(request),
         month_slug=selected_month(request),
@@ -1155,6 +1168,56 @@ async def transport_delete(request: Request, row_id: int):
     delete_transport(db(), row_id, owner_id(request), month_slug=selected_month(request))
     flash(request, "Deleted.")
     return RedirectResponse("/transport", status_code=303)
+
+
+@app.post("/receipts/{ref}/description")
+async def receipts_description(request: Request, ref: int, description: str = Form("")):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    text = description.strip()
+    if not text:
+        flash(request, "Description cannot be empty.", "err")
+        return RedirectResponse("/", status_code=303)
+    if set_row_field(
+        db(),
+        "receipts",
+        "ref",
+        ref,
+        "description",
+        text,
+        month_slug=selected_month(request),
+        owner_id=owner_id(request),
+    ):
+        flash(request, "Description updated.")
+    else:
+        flash(request, "Receipt not found.", "err")
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/credit-card/{row_id}/description")
+async def credit_description(request: Request, row_id: int, description: str = Form("")):
+    gate = require_auth(request)
+    if gate:
+        return gate
+    text = description.strip()
+    if not text:
+        flash(request, "Description cannot be empty.", "err")
+        return RedirectResponse("/credit-card", status_code=303)
+    if set_row_field(
+        db(),
+        "credit_card",
+        "id",
+        row_id,
+        "description",
+        text,
+        month_slug=selected_month(request),
+        owner_id=owner_id(request),
+    ):
+        flash(request, "Description updated.")
+    else:
+        flash(request, "Expense not found.", "err")
+    return RedirectResponse("/credit-card", status_code=303)
 
 
 @app.post("/receipts/{ref}/project-code")

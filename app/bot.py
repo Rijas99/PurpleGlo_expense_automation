@@ -168,9 +168,9 @@ def _save_if_ready(
     image_mime: str,
     owner_id: int | None = None,
 ) -> str:
-    project_name = str(draft.get("project_name") or "").strip()
+    project_name = str(draft.get("project_code") or draft.get("project_name") or "").strip()
     if not project_name:
-        return "Project name is required. Send the photo again with the project name as the caption, e.g. adnoc"
+        return "Project code is required. Send the photo again with a caption like: adnoc, lunch, 80"
     kind = draft.get("kind") or "receipt"
     date = format_display_date(str(draft.get("date") or ""))
 
@@ -186,7 +186,7 @@ def _save_if_ready(
                 "from_location": from_location,
                 "destination": destination,
                 "return_included": bool(draft.get("return_included")),
-                "project_code": str(draft.get("project_code") or "").strip(),
+                "project_code": project_name,
                 "project_name": project_name,
                 "owner_id": owner_id,
             },
@@ -201,7 +201,7 @@ def _save_if_ready(
                 "date": date,
                 "description": str(draft.get("description") or "").strip() or "Credit card",
                 "category": draft.get("category") or "Can't classify",
-                "project_code": str(draft.get("project_code") or "").strip(),
+                "project_code": project_name,
                 "project_name": project_name,
                 "amount": float(draft.get("amount") or 0),
                 "image_bytes": image_bytes,
@@ -224,7 +224,7 @@ def _save_if_ready(
             "date": date,
             "description": desc,
             "category": draft.get("category") or "Can't classify",
-            "project_code": str(draft.get("project_code") or "").strip(),
+            "project_code": project_name,
             "project_name": project_name,
             "amount": amount,
             "image_bytes": image_bytes,

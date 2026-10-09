@@ -10,7 +10,7 @@
     <thead>
       <tr>
         <th>Date</th><th>From</th><th>Destination</th>
-        <th>Return</th><th>Project code</th><th>Project name</th><th></th>
+        <th>Return</th><th>Project code</th><th></th>
       </tr>
     </thead>
     <tbody>
@@ -29,7 +29,6 @@
           {{ r.project_code }}
           {% endif %}
         </td>
-        <td>{{ r.project_name }}</td>
         <td>
           {% if can_edit %}
           <div class="row-actions">
@@ -42,7 +41,7 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="7" class="empty">No transport records yet.</td></tr>
+      <tr><td colspan="6" class="empty">No transport records yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>
@@ -54,13 +53,11 @@
   <label>Date <input type="date" name="date" value="{{ a.get('date') or today }}" required /></label>
   <label>From <input name="from_location" required placeholder="Dubai, UAE" value="{{ a.get('from_location') or '' }}" /></label>
   <label>Destination <input name="destination" required placeholder="Abu Dhabi, UAE" value="{{ a.get('destination') or '' }}" /></label>
-  <label>Project code <input name="project_code" list="codes" value="{{ a.get('project_code') or '' }}" /></label>
-  <label>Project name * <input name="project_name" list="names" required value="{{ a.get('project_name') or '' }}" /></label>
+  <label>Project code * <input name="project_code" list="codes" required value="{{ a.get('project_code') or a.get('project_name') or '' }}" /></label>
   <label class="check"><input type="checkbox" name="return_included" value="1" {% if a.get('return_included') %}checked{% endif %} /> Return included</label>
   <button type="submit">{% if editing %}Update trip{% else %}Save{% endif %}</button>
   {% if editing %}<a class="meta" href="/transport">Cancel</a>{% endif %}
 </form>
 <datalist id="codes">{% for code in project_codes %}<option value="{{ code }}">{% endfor %}</datalist>
-<datalist id="names">{% for n in project_names %}<option value="{{ n }}">{% endfor %}</datalist>
 {% endif %}
 {% endblock %}

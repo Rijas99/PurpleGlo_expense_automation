@@ -56,8 +56,8 @@ def format_draft_message(draft: dict) -> str:
 
     kind = draft.get("kind") or "receipt"
     missing = []
-    if not str(draft.get("project_name") or "").strip():
-        missing.append("project name")
+    if not str(draft.get("project_code") or draft.get("project_name") or "").strip():
+        missing.append("project code")
     if kind == "transport":
         if not str(draft.get("from_location") or "").strip():
             missing.append("from")
@@ -77,7 +77,7 @@ def format_draft_message(draft: dict) -> str:
                 f"From: {draft.get('from_location') or '—'}",
                 f"Destination: {draft.get('destination') or '—'}",
                 f"Return: {'yes' if draft.get('return_included') else 'no'}",
-                f"Project name: {draft.get('project_name') or '—'}",
+                f"Project code: {draft.get('project_code') or draft.get('project_name') or '—'}",
             ]
         )
     else:
@@ -87,7 +87,7 @@ def format_draft_message(draft: dict) -> str:
                 f"Description: {draft.get('description') or '—'}",
                 f"Category: {draft.get('category') or '—'}",
                 f"Amount: {amount_show}",
-                f"Project name: {draft.get('project_name') or '—'}",
+                f"Project code: {draft.get('project_code') or draft.get('project_name') or '—'}",
             ]
         )
     lines.extend(
